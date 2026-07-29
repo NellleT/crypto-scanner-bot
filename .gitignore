@@ -1,0 +1,31 @@
+# Secrets — never commit.
+# Covers backups and variants (.env.v1.bak, .env.local, ...) so a copy of the
+# credentials can never be staged. The negation must come last to take effect.
+.env
+.env.*
+*.env
+*.bak
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

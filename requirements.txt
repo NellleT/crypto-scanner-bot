@@ -1,0 +1,22 @@
+# Crypto Scanner Bot v2 — runtime dependencies (Python 3.10+)
+
+ccxt>=4.2.0,<5.0.0            # unified exchange API (public market data only)
+pandas>=2.1.0,<3.0.0          # OHLCV manipulation
+requests>=2.31.0,<3.0.0       # Telegram Bot API transport
+python-dotenv>=1.0.0,<2.0.0   # .env loading
+
+# --- Technical indicators --------------------------------------------------
+# `pandas-ta-classic` is the maintained fork of the classic pandas-ta 0.3.x API
+# (same `ta.sma` / `df.ta` interface). It is used instead of `pandas-ta` because
+# that package no longer installs on current interpreters: 0.3.14b0 has been
+# withdrawn from PyPI, and the remaining 0.4.x releases require `numba`, which
+# supports only Python < 3.14.
+#
+# If you are pinned to Python <= 3.13 and would rather use the original, swap
+# this line for `pandas-ta==0.3.14b0` — scanner/indicators.py imports either
+# distribution transparently, and falls back to the equivalent pandas rolling
+# mean if neither is present.
+pandas-ta-classic>=0.6.0
+
+# Optional — for running the test suite:
+# pytest>=8.0.0
