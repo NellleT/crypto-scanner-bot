@@ -31,5 +31,4 @@ jobs:
         SYMBOLS: ${{ secrets.SYMBOLS }}
         TIMEFRAME: ${{ secrets.TIMEFRAME }}
       run: |
-        cd scanner
-        python bot.py
+        python main.py
