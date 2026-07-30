@@ -45,7 +45,7 @@ class MarketDataClient:
 
     def __init__(
         self,
-        exchange_id: str = "bybit",
+        exchange_id: str = "kraken",
         *,
         timeout_seconds: float = 15.0,
         max_retries: int = 3,
@@ -57,6 +57,7 @@ class MarketDataClient:
         self._retry_backoff_seconds = retry_backoff_seconds
         self._stop_event = stop_event or threading.Event()
         self._markets_loaded = False
+        self._short_response_warned: set[str] = set()
 
         try:
             exchange_class: type[ccxt.Exchange] = getattr(ccxt, exchange_id)
@@ -188,9 +189,9 @@ class MarketDataClient:
         """Fetch OHLCV candles as a typed ``DataFrame`` sorted oldest → newest.
 
         When ``drop_unclosed`` is true (the default) the final bar is discarded
-        if its close time has not yet passed. Bybit and Binance both return the
-        in-progress candle as the last element, and evaluating it would produce
-        signals that vanish before the bar actually closes.
+        if its close time has not yet passed. Kraken, Bybit and Binance all
+        return the in-progress candle as the last element, and evaluating it
+        would produce signals that vanish before the bar actually closes.
         """
         raw: list[list[float]] = self._with_retries(
             f"fetch_ohlcv({symbol}, {timeframe})",
@@ -200,6 +201,23 @@ class MarketDataClient:
         if not raw:
             logger.warning("No OHLCV data returned for %s %s.", symbol, timeframe)
             return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
+
+        # Venues cap OHLCV history at different depths — Kraken tops out around
+        # 720 candles regardless of what is asked for. Silently receiving fewer
+        # bars than requested starves the moving averages, and the only symptom
+        # would be a scanner that warms up forever and never alerts. Say so once.
+        if len(raw) < limit * 0.95 and symbol not in self._short_response_warned:
+            self._short_response_warned.add(symbol)
+            logger.warning(
+                "%s returned %d of the %d candles requested for %s %s. This is a "
+                "venue history cap; make sure it still covers your indicator "
+                "periods, or the scanner will never warm up.",
+                self._exchange_id,
+                len(raw),
+                limit,
+                symbol,
+                timeframe,
+            )
 
         df = pd.DataFrame(raw, columns=list(REQUIRED_COLUMNS))
         df = df.astype(

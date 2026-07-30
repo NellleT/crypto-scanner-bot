@@ -29,18 +29,28 @@ from scanner.risk import (
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 
-DEFAULT_SYMBOLS: Final[tuple[str, ...]] = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
+#: Default venue. Both Binance and Bybit restrict the IP ranges GitHub Actions
+#: runners use, so a scheduled workflow cannot fetch candles from either.
+#: Kraken is US-regulated and serves those runners without geo-blocking.
+DEFAULT_EXCHANGE_ID: Final[str] = "kraken"
+
+#: Default watchlist, quoted in USD rather than USDT.
+#:
+#: Kraken is primarily a fiat venue: measured over 200 4h candles, its USD pairs
+#: carry a median **19.2x** the turnover of the matching USDT pair, and the thin
+#: USDT books print flat and zero-volume bars (DOT/USDT: ~$1.9k per 4h, 18 bars
+#: with high == low). Two of the four filters are volume-based, so that is the
+#: difference between measuring participation and measuring noise. The two feeds
+#: track within 0.07% at the median, so the trend and pattern logic sees the same
+#: market either way. On a USDT-primary venue (Binance, Bybit) use USDT pairs.
+DEFAULT_SYMBOLS: Final[tuple[str, ...]] = ("BTC/USD", "ETH/USD", "SOL/USD")
+
 DEFAULT_TIMEFRAME: Final[str] = "4h"
 DEFAULT_CANDLE_LIMIT: Final[int] = 300
 
-#: Default venue. Bybit rather than Binance because Binance geo-blocks the IP
-#: ranges GitHub Actions runners use and answers with HTTP 451, so a scheduled
-#: workflow can never fetch candles from it. Bybit serves the same unified
-#: symbols, timeframes and base-asset volumes, so the switch is configuration
-#: only. Override with EXCHANGE_ID for any CCXT venue with public OHLCV.
-DEFAULT_EXCHANGE_ID: Final[str] = "bybit"
-
-#: Most venues, Bybit and Binance included, cap one OHLCV request at 1000 candles.
+#: Upper bound accepted for CANDLE_LIMIT. Individual venues cap lower — Kraken
+#: returns at most ~720 candles — and :mod:`scanner.exchange` warns when a
+#: response comes back materially short of what was requested.
 MAX_CANDLE_LIMIT: Final[int] = 1000
 
 # Timeframe tokens: <int><unit> where unit is m/h/d/w/M.

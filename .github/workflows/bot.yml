@@ -47,11 +47,16 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Binance geo-blocks GitHub's runner IP ranges and returns HTTP 451,
-          # so market data is fetched from Bybit here.
-          EXCHANGE_ID: bybit
+          # Binance and Bybit both restrict the IP ranges GitHub's runners use,
+          # so neither can serve market data here. Kraken is US-regulated and
+          # does not geo-block them.
+          EXCHANGE_ID: kraken
           # Optional overrides. Unset secrets arrive as empty strings, which the
-          # config layer treats as "not set" and falls back to its defaults.
+          # config layer treats as "not set" and falls back to its defaults —
+          # BTC/USD,ETH/USD,SOL/USD. Kraken is a fiat-primary venue whose USD
+          # books carry ~19x the turnover of the matching USDT pairs, so if you
+          # DO set this secret, prefer USD pairs: two of the four filters are
+          # volume-based and thin USDT books make them measure noise.
           SYMBOLS: ${{ secrets.SYMBOLS }}
           TIMEFRAME: ${{ secrets.TIMEFRAME }}
           DRY_RUN: ${{ inputs.dry_run }}

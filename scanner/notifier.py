@@ -143,18 +143,17 @@ def format_volume(volume: float) -> str:
 
 def build_risk_section(
     signal: TradeSignal,
-    *,
-    to_precision: Callable[[float], str | None] | None = None,
+    entry: str,
+    stop: str,
+    targets: Sequence[str],
 ) -> list[str]:
-    """Render the risk-management block.
+    """Render the risk-management block from pre-formatted price strings.
 
-    ``to_precision`` maps a price to the venue's tick-size string; when absent,
-    magnitude-based formatting is used instead.
+    Formatting is done by the caller so that every price in the message — the
+    headline price and the SMA included — shares one decimal count. Rendering
+    this block independently produced ``Price: 41.7`` above ``Entry: $41.70``.
     """
     plan = signal.risk
-    prices = plan.prices()
-    texts = [to_precision(p) for p in prices] if to_precision else None
-    entry, stop, *targets = format_price_group(prices, texts)
     unit = quote_prefix(signal.symbol)
 
     lines = [
@@ -181,9 +180,20 @@ def build_message(
     sma_text: str | None = None,
     to_precision: Callable[[float], str | None] | None = None,
 ) -> str:
-    """Compose the HTML message body for a confirmed multi-factor signal."""
-    price = humanize_price(signal.price, price_text)
-    sma = align_decimals(signal.trend_sma, sma_text, price)
+    """Compose the HTML message body for a confirmed multi-factor signal.
+
+    Every price in the message is formatted as one group so the headline price,
+    the SMA and the risk ladder all carry the same number of decimals — they are
+    read against each other, and ragged precision looks like an error.
+    """
+    plan = signal.risk
+    values = (signal.price, signal.trend_sma, *plan.prices())
+    if to_precision is not None:
+        texts: list[str | None] = [to_precision(v) for v in values]
+    else:
+        texts = [price_text, sma_text, *([None] * len(plan.prices()))]
+
+    price, sma, entry, stop, *targets = format_price_group(values, texts)
     closed_at = signal.candle_open_time.strftime("%Y-%m-%d %H:%M UTC")
     side = "above" if signal.sma_distance_pct >= 0 else "below"
 
@@ -206,7 +216,7 @@ def build_message(
         f" {html.escape(format_volume(signal.previous_volume))}"
         f"  <i>(follow-through confirmed)</i>",
         "",
-        *build_risk_section(signal, to_precision=to_precision),
+        *build_risk_section(signal, entry, stop, targets),
         "",
         f"<i>Engulf ratio: {signal.engulf_ratio:.2f}x · Candle open {html.escape(closed_at)}</i>",
     ]

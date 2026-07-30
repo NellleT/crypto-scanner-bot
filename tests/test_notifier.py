@@ -137,6 +137,28 @@ def test_risk_prices_all_share_one_decimal_count() -> None:
     assert "2,009.34" in message  # 1925.91 + 3 * 27.81
 
 
+def test_headline_price_and_entry_are_formatted_identically() -> None:
+    """They are the same number; `Price: 41.7` above `Entry: $41.70` looks broken."""
+    plan = make_plan(entry=41.70, stop_loss=45.82, is_long=False, ratios=(2.0,))
+    message = build_message(
+        make_signal(SignalDirection.SHORT, price=41.70, trend_sma=46.91, risk=plan),
+        to_precision=lambda v: f"{v:.10g}",  # strips trailing zeros, as venues do
+    )
+    assert "<b>Price:</b> <code>41.70</code>" in message
+    assert "<code>$41.70</code>" in message
+    assert "41.7<" not in message  # no bare one-decimal rendering anywhere
+
+
+def test_every_price_in_the_message_shares_a_decimal_count() -> None:
+    plan = make_plan(entry=100.0, stop_loss=98.5, ratios=(2.0, 3.0))
+    message = build_message(
+        make_signal(price=100.0, trend_sma=95.0, risk=plan),
+        to_precision=lambda v: f"{v:.10g}",
+    )
+    for expected in ("100.0", "95.0", "98.5", "103.0", "104.5"):
+        assert expected in message, f"missing {expected!r}"
+
+
 def test_risk_percentages_are_reported() -> None:
     plan = make_plan(entry=100.0, stop_loss=98.0, ratios=(2.0,))
     message = build_message(make_signal(price=100.0, risk=plan))

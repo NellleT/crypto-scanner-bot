@@ -1,6 +1,6 @@
 # Crypto Scanner Bot v2.2
 
-Monitors a watchlist of USDT pairs (Bybit by default) and sends a Telegram alert when an
+Monitors a watchlist of crypto pairs (Kraken by default) and sends a Telegram alert when an
 engulfing reversal closes **in agreement with the trend regime, on above-average
 volume that is also expanding bar-on-bar** — with a structural stop-loss and R:R
 targets attached.
@@ -202,24 +202,24 @@ definition.
 
 ### How much the filters actually remove
 
-Measured on **Bybit** over 799 closed 4h candles on each of 10 major pairs
-(7,990 evaluations):
+Measured on **Kraken** over 519 closed 4h candles on each of 10 USD pairs
+(5,190 evaluations):
 
 | Stage | Count | Share |
 | --- | --- | --- |
-| Raw engulfing patterns | 1,819 | — |
-| Rejected by trend filter | 852 | 47% of patterns |
-| Rejected by volume filter | 563 | 58% of what remained |
-| Rejected by VSA filter | 75 | 19% of what remained |
-| **Confirmed signals** | **329** | **18% of patterns** |
+| Raw engulfing patterns | 714 | — |
+| Rejected by trend filter | 337 | 47% of patterns |
+| Rejected by volume filter | 230 | 61% of what remained |
+| Rejected by VSA filter | 33 | 23% of what remained |
+| **Confirmed signals** | **114** | **16% of patterns** |
 
-The `VOL_SMA_20` filter is the most selective single stage. Roughly 18% of raw
-patterns survive the chain on either venue — the proportion is stable even
-though Bybit's gapless candles produce far more raw patterns than Binance's.
+The `VOL_SMA_20` filter is the most selective single stage. **16–18% of raw
+patterns survive the chain on every venue tested** — a useful invariant, since
+the raw pattern count itself varies a lot with a venue's candle conventions.
 
-Expect about one signal per pair per 30 4h candles (~5 days). Ten pairs on `4h`
-is therefore ~2 alerts/day. Shorter timeframes scale that up roughly linearly;
-raise `MIN_BODY_RATIO` or `VOLUME_SMA_PERIOD` if you want it quieter.
+Expect about one signal per pair per 45 4h candles (~7 days). Ten pairs on `4h`
+is therefore roughly one alert a day. Shorter timeframes scale that up roughly
+linearly; raise `MIN_BODY_RATIO` or `VOLUME_SMA_PERIOD` if you want it quieter.
 
 Every pass logs this funnel, so you can see where candidates are dropping out:
 
@@ -231,6 +231,38 @@ The stages are `warmup`, `pattern`, `trend`, `volume`, `vsa`, `risk`,
 `confirmed`, plus `error`. A stage naming where evaluation *stopped*, so
 `vsa=1` means one candidate passed the trend and liquidity filters and failed
 only on follow-through.
+
+---
+
+## Choosing an exchange
+
+`EXCHANGE_ID` accepts any CCXT venue with public OHLCV, but venues differ in
+ways that silently change what the scanner sees. Measured on 4h candles:
+
+| Venue | Works from GitHub Actions | Candle history | `open == prev close` | Notes |
+| --- | --- | --- | --- | --- |
+| **Kraken** *(default)* | ✅ | ~720 | 7% | Fiat-primary — **use USD pairs** |
+| Bybit | ❌ restricted IPs | 1000 | **100%** | Gapless feed, see below |
+| Binance | ❌ HTTP 451 | 1000 | ~50% | Best liquidity if reachable |
+
+Two traps worth knowing about:
+
+**Quote currency matters on Kraken.** It is a fiat-primary venue: its USD books
+carry a median **19.2×** the turnover of the matching USDT pair. The thin USDT
+books print candles with no volume at all and candles where `high == low`
+(DOT/USDT: ~$1.9k per 4h, 18 flat bars in 200). Two of the four filters are
+volume-based, so on a thin book they measure noise rather than participation.
+The two feeds track within **0.07%** at the median and produce comparable signal
+counts, so USD pairs are strictly the better feed here. On a USDT-primary venue
+(Binance, Bybit) use USDT pairs instead.
+
+**Gapless feeds break gap-based rules.** Bybit stitches every candle open to the
+previous close. That is why the engulfing rule compares bodies rather than
+requiring a gap — see [engulfing definition](#engulfing-definition).
+
+The scanner warns when a venue returns materially fewer candles than requested,
+since a silent history cap starves the moving averages and the only symptom
+would be a scanner that never alerts.
 
 ---
 
@@ -330,9 +362,9 @@ Flags override `.env` values.
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | — | BotFather token. Required unless `DRY_RUN=true`. |
 | `TELEGRAM_CHAT_ID` | — | Destination chat/channel. Required unless `DRY_RUN=true`. |
-| `SYMBOLS` | `BTC/USDT,ETH/USDT,SOL/USDT` | Watchlist in CCXT unified format. |
+| `SYMBOLS` | `BTC/USD,ETH/USD,SOL/USD` | Watchlist in CCXT unified format. |
 | `TIMEFRAME` | `4h` | Candle size: `1m`, `5m`, `15m`, `1h`, `4h`, `1d`… |
-| `EXCHANGE_ID` | `bybit` | Any CCXT exchange id with public OHLCV. |
+| `EXCHANGE_ID` | `kraken` | Any CCXT exchange id with public OHLCV. |
 | `CANDLE_LIMIT` | `300` | Candles per request. Must be ≥ `SMA_PERIOD + 2`; venue max 1000. |
 | `SMA_PERIOD` | `200` | Trend filter period. |
 | `VOLUME_SMA_PERIOD` | `20` | Volume filter period. |
@@ -479,9 +511,10 @@ cron schedule. Three things matter:
    the "already alerted" state is in memory, so a candle scanned by two runs is
    alerted twice. Hourly cron pairs with `TIMEFRAME=1h`; for `4h` use
    `'5 0,4,8,12,16,20 * * *'`.
-3. **Do not use Binance.** It geo-blocks GitHub's runner IP ranges and returns
-   HTTP 451, so the job cannot fetch candles. The workflow pins `EXCHANGE_ID:
-   bybit`.
+3. **Exchange choice is not free.** Both Binance and Bybit restrict the IP
+   ranges GitHub's runners use, so neither can serve market data from a
+   workflow. The workflow pins `EXCHANGE_ID: kraken`, which is US-regulated and
+   does not geo-block them. See [choosing an exchange](#choosing-an-exchange).
 
 Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` under *Settings → Secrets and
 variables → Actions*. Run it manually first from the *Actions* tab — the
