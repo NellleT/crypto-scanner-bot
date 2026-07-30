@@ -1,6 +1,6 @@
 """Crypto Scanner Bot v2 — entrypoint.
 
-Monitors a configurable set of Binance USDT pairs and sends a Telegram alert
+Monitors a configurable set of USDT pairs (Bybit by default) and sends an alert
 when an engulfing reversal closes *in agreement with* the SMA-200 trend regime
 and on above-average volume.
 
@@ -36,7 +36,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="crypto-scanner",
         description=(
-            "Scan Binance pairs for engulfing reversals confirmed by the SMA-200 "
+            "Scan exchange pairs for engulfing reversals confirmed by the SMA-200 "
             "trend regime and above-average volume."
         ),
     )

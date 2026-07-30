@@ -1,4 +1,4 @@
-"""Crypto Scanner Bot — multi-factor engulfing scanner for Binance spot markets.
+"""Crypto Scanner Bot — multi-factor engulfing scanner for crypto spot markets.
 
 Signals require an engulfing reversal to agree with the SMA-200 trend regime and
 be backed by volume that is both above its own average and expanding over the

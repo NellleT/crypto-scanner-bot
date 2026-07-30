@@ -45,7 +45,7 @@ class MarketDataClient:
 
     def __init__(
         self,
-        exchange_id: str = "binance",
+        exchange_id: str = "bybit",
         *,
         timeout_seconds: float = 15.0,
         max_retries: int = 3,
@@ -188,9 +188,9 @@ class MarketDataClient:
         """Fetch OHLCV candles as a typed ``DataFrame`` sorted oldest → newest.
 
         When ``drop_unclosed`` is true (the default) the final bar is discarded
-        if its close time has not yet passed. Binance returns the in-progress
-        candle as the last element, and evaluating it would produce signals that
-        vanish before the bar actually closes.
+        if its close time has not yet passed. Bybit and Binance both return the
+        in-progress candle as the last element, and evaluating it would produce
+        signals that vanish before the bar actually closes.
         """
         raw: list[list[float]] = self._with_retries(
             f"fetch_ohlcv({symbol}, {timeframe})",

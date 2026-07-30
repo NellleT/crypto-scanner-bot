@@ -1,34 +1,61 @@
 name: Crypto Trading Bot 24/7
 
+# The cron interval MUST match TIMEFRAME. Each run is a fresh process, and the
+# "already alerted" state is in memory only, so a candle scanned by two runs is
+# alerted twice. Hourly cron therefore pairs with TIMEFRAME=1h.
+#   1h  -> '5 * * * *'
+#   4h  -> '5 0,4,8,12,16,20 * * *'
+#   15m -> '5,20,35,50 * * * *'
+# GitHub's scheduler is best-effort and can lag several minutes under load; a
+# missed run just means that candle is skipped, never a duplicate alert.
 on:
   schedule:
-  - cron: '5 * * * *'
+    - cron: '5 * * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Log alerts instead of sending them'
+        type: boolean
+        default: false
+
+concurrency:
+  # A late run must not overlap the next scheduled one.
+  group: crypto-scanner
+  cancel-in-progress: false
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        cache: 'pip'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Run Trading Bot
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        SYMBOLS: ${{ secrets.SYMBOLS }}
-        TIMEFRAME: ${{ secrets.TIMEFRAME }}
-      run: |
-        python main.py
+      - name: Run Trading Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Binance geo-blocks GitHub's runner IP ranges and returns HTTP 451,
+          # so market data is fetched from Bybit here.
+          EXCHANGE_ID: bybit
+          # Optional overrides. Unset secrets arrive as empty strings, which the
+          # config layer treats as "not set" and falls back to its defaults.
+          SYMBOLS: ${{ secrets.SYMBOLS }}
+          TIMEFRAME: ${{ secrets.TIMEFRAME }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # --once is required: the default mode runs forever, which on a cron
+          # schedule would pin a job until the timeout and overlap the next run.
+          python main.py --once

@@ -33,10 +33,17 @@ DEFAULT_SYMBOLS: Final[tuple[str, ...]] = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
 DEFAULT_TIMEFRAME: Final[str] = "4h"
 DEFAULT_CANDLE_LIMIT: Final[int] = 300
 
-#: Most venues, Binance included, cap a single OHLCV request at 1000 candles.
+#: Default venue. Bybit rather than Binance because Binance geo-blocks the IP
+#: ranges GitHub Actions runners use and answers with HTTP 451, so a scheduled
+#: workflow can never fetch candles from it. Bybit serves the same unified
+#: symbols, timeframes and base-asset volumes, so the switch is configuration
+#: only. Override with EXCHANGE_ID for any CCXT venue with public OHLCV.
+DEFAULT_EXCHANGE_ID: Final[str] = "bybit"
+
+#: Most venues, Bybit and Binance included, cap one OHLCV request at 1000 candles.
 MAX_CANDLE_LIMIT: Final[int] = 1000
 
-# Binance-style timeframe tokens: <int><unit> where unit is m/h/d/w/M.
+# Timeframe tokens: <int><unit> where unit is m/h/d/w/M.
 _TIMEFRAME_RE: Final[re.Pattern[str]] = re.compile(r"^\d+[mhdwM]$")
 
 _TRUTHY: Final[frozenset[str]] = frozenset({"1", "true", "yes", "y", "on"})
@@ -267,7 +274,7 @@ class Settings:
             telegram_chat_id=_get_str("TELEGRAM_CHAT_ID", required=not dry_run),
             symbols=parse_symbols(symbols_raw),
             timeframe=timeframe,
-            exchange_id=_get_str("EXCHANGE_ID", "binance").lower(),
+            exchange_id=_get_str("EXCHANGE_ID", DEFAULT_EXCHANGE_ID).lower(),
             candle_limit=candle_limit,
             sma_period=sma_period,
             volume_sma_period=volume_sma_period,

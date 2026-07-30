@@ -49,9 +49,22 @@ def test_bullish_engulfing_is_detected() -> None:
     assert classify_engulfing(previous, current) is PatternType.BULLISH_ENGULFING
 
 
-def test_bullish_requires_open_below_previous_close() -> None:
+def test_bullish_accepts_an_open_exactly_at_the_previous_close() -> None:
+    """No gap is required — Bybit stitches every candle open to the prior close.
+
+    Demanding ``open < prev.close`` makes the pattern undetectable on venues
+    that publish a continuous series (100% of Bybit candles), which is a
+    property of the data feed, not of price action.
+    """
     previous = make_candle(100.0, 101.0, 97.0, 98.0)
     current = make_candle(98.0, 101.5, 98.0, 100.5, index=1)  # opens AT previous close
+    assert classify_engulfing(previous, current) is PatternType.BULLISH_ENGULFING
+
+
+def test_bullish_rejects_an_open_above_the_previous_close() -> None:
+    """Opening inside the previous body means it was never fully engulfed."""
+    previous = make_candle(100.0, 101.0, 97.0, 98.0)
+    current = make_candle(99.0, 101.5, 98.5, 100.5, index=1)
     assert classify_engulfing(previous, current) is None
 
 
@@ -74,6 +87,27 @@ def test_bearish_requires_strictly_engulfing_body() -> None:
     previous = make_candle(98.0, 101.0, 97.0, 100.0)
     current = make_candle(100.5, 101.0, 97.0, 98.5, index=1)  # closes inside previous body
     assert classify_engulfing(previous, current) is None
+
+
+def test_bearish_accepts_an_open_exactly_at_the_previous_close() -> None:
+    previous = make_candle(98.0, 101.0, 97.0, 100.0)
+    current = make_candle(100.0, 101.0, 97.0, 97.5, index=1)  # opens AT previous close
+    assert classify_engulfing(previous, current) is PatternType.BEARISH_ENGULFING
+
+
+def test_close_matching_the_previous_open_is_not_engulfing() -> None:
+    """The close side stays strict: matching is not covering."""
+    previous = make_candle(98.0, 101.0, 97.0, 100.0)
+    current = make_candle(100.0, 101.0, 97.0, 98.0, index=1)  # closes AT previous open
+    assert classify_engulfing(previous, current) is None
+
+
+def test_stitched_series_still_produces_patterns() -> None:
+    """Simulates a Bybit-style feed where every open equals the prior close."""
+    bearish = make_candle(100.0, 101.0, 97.0, 98.0)
+    bullish = make_candle(98.0, 102.0, 97.5, 101.0, index=1)
+    assert bullish.open == bearish.close
+    assert classify_engulfing(bearish, bullish) is PatternType.BULLISH_ENGULFING
 
 
 # ---------------------------------------------------------------------------

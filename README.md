@@ -1,6 +1,6 @@
 # Crypto Scanner Bot v2.2
 
-Monitors a watchlist of Binance USDT pairs and sends a Telegram alert when an
+Monitors a watchlist of USDT pairs (Bybit by default) and sends a Telegram alert when an
 engulfing reversal closes **in agreement with the trend regime, on above-average
 volume that is also expanding bar-on-bar** — with a structural stop-loss and R:R
 targets attached.
@@ -137,7 +137,9 @@ Stop with `Ctrl+C` — shutdown is graceful and interrupts any pending sleep.
 
 ## Signal logic
 
-A candle must satisfy **all four** conditions. All comparisons are strict.
+A candle must satisfy **all four** conditions. The trend and volume comparisons
+are strict; see [below](#engulfing-definition) for the one inclusive comparison
+in the pattern rule.
 
 | Filter | LONG | SHORT |
 | --- | --- | --- |
@@ -154,10 +156,11 @@ first asks whether participation is high against the recent norm; the second
 whether it *expanded* over the very bar being engulfed. See
 [what's new in v2.2](#whats-new-in-v22) for how often they disagree in practice.
 
-Everything is evaluated on the **most recently closed** candle. Binance returns
-the still-forming candle as the last element of any OHLCV response, so that bar
-is discarded *before* indicators are computed — otherwise both the moving
-averages and the signal itself would repaint as the bar developed.
+Everything is evaluated on the **most recently closed** candle. Bybit and
+Binance both return the still-forming candle as the last element of any OHLCV
+response, so that bar is discarded *before* indicators are computed — otherwise
+both the moving averages and the signal itself would repaint as the bar
+developed.
 
 ### Engulfing definition
 
@@ -167,9 +170,27 @@ Writing `P` for the previous candle and `C` for the signal candle:
 Bullish                        Bearish
 P.close < P.open   (bearish)   P.close > P.open   (bullish)
 C.close > C.open   (bullish)   C.close < C.open   (bearish)
-C.open  < P.close              C.open  > P.close
+C.open <= P.close              C.open >= P.close
 C.close > P.open               C.close < P.open
 ```
+
+**The open comparison is inclusive, the close comparison is strict.** The
+textbook form demands a *gap* past the previous close (`C.open < P.close`),
+which is an assumption inherited from session-based markets. In 24/7 crypto it
+makes the rule depend on how a venue stitches candles rather than on price
+action:
+
+| Venue | `open == prev close` | Patterns, strict `<` | Patterns, `<=` |
+| --- | --- | --- | --- |
+| Bybit | **100%** | **0** | 216–240 |
+| Binance | ~50% | 34–58 | 151–177 |
+
+Bybit publishes a continuous series where every candle opens exactly at the
+previous close, so `C.open < P.close` is unsatisfiable there and the strict form
+detects **nothing at all**. The inclusive form gives comparable counts on both
+venues. Containment still holds with equality: if the open sits at the previous
+close and the close exceeds the previous open, the signal body spans the entire
+previous body.
 
 Both candles must also have a real body of at least `MIN_BODY_RATIO` of their
 own high-low range. The four inequalities are trivially satisfied when the
@@ -181,20 +202,24 @@ definition.
 
 ### How much the filters actually remove
 
-Measured over 799 closed 4h candles on each of 10 major pairs (7,990
-evaluations):
+Measured on **Bybit** over 799 closed 4h candles on each of 10 major pairs
+(7,990 evaluations):
 
 | Stage | Count | Share |
 | --- | --- | --- |
-| Raw engulfing patterns | 391 | — |
-| Rejected by trend filter | 176 | 45% of patterns |
-| Rejected by volume filter | 134 | 62% of what remained |
-| Rejected by VSA filter | 11 | 14% of what remained |
-| **Confirmed signals** | **68** | **17% of patterns** |
+| Raw engulfing patterns | 1,819 | — |
+| Rejected by trend filter | 852 | 47% of patterns |
+| Rejected by volume filter | 563 | 58% of what remained |
+| Rejected by VSA filter | 75 | 19% of what remained |
+| **Confirmed signals** | **329** | **18% of patterns** |
 
-The `VOL_SMA_20` filter is the most selective single stage. Expect roughly one
-signal per pair per 120 4h candles — v2.2 is substantially quieter than v1 by
-design.
+The `VOL_SMA_20` filter is the most selective single stage. Roughly 18% of raw
+patterns survive the chain on either venue — the proportion is stable even
+though Bybit's gapless candles produce far more raw patterns than Binance's.
+
+Expect about one signal per pair per 30 4h candles (~5 days). Ten pairs on `4h`
+is therefore ~2 alerts/day. Shorter timeframes scale that up roughly linearly;
+raise `MIN_BODY_RATIO` or `VOLUME_SMA_PERIOD` if you want it quieter.
 
 Every pass logs this funnel, so you can see where candidates are dropping out:
 
@@ -307,7 +332,7 @@ Flags override `.env` values.
 | `TELEGRAM_CHAT_ID` | — | Destination chat/channel. Required unless `DRY_RUN=true`. |
 | `SYMBOLS` | `BTC/USDT,ETH/USDT,SOL/USDT` | Watchlist in CCXT unified format. |
 | `TIMEFRAME` | `4h` | Candle size: `1m`, `5m`, `15m`, `1h`, `4h`, `1d`… |
-| `EXCHANGE_ID` | `binance` | Any CCXT exchange id with public OHLCV. |
+| `EXCHANGE_ID` | `bybit` | Any CCXT exchange id with public OHLCV. |
 | `CANDLE_LIMIT` | `300` | Candles per request. Must be ≥ `SMA_PERIOD + 2`; venue max 1000. |
 | `SMA_PERIOD` | `200` | Trend filter period. |
 | `VOLUME_SMA_PERIOD` | `20` | Volume filter period. |
@@ -441,6 +466,30 @@ journalctl -u crypto-scanner -f
 **Windows** — Task Scheduler with "Run whether user is logged on or not", action
 set to your venv's `python.exe` with argument `main.py`, and "Start in" set to
 the project directory.
+
+### GitHub Actions
+
+[`.github/workflows/bot.yml`](.github/workflows/bot.yml) runs the scanner on a
+cron schedule. Three things matter:
+
+1. **Use `--once`, never bare `main.py`.** The default mode loops forever; on a
+   schedule it would pin a job until the timeout and overlap the next run,
+   burning Actions minutes for no benefit.
+2. **Match the cron interval to `TIMEFRAME`.** Each run is a fresh process and
+   the "already alerted" state is in memory, so a candle scanned by two runs is
+   alerted twice. Hourly cron pairs with `TIMEFRAME=1h`; for `4h` use
+   `'5 0,4,8,12,16,20 * * *'`.
+3. **Do not use Binance.** It geo-blocks GitHub's runner IP ranges and returns
+   HTTP 451, so the job cannot fetch candles. The workflow pins `EXCHANGE_ID:
+   bybit`.
+
+Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` under *Settings → Secrets and
+variables → Actions*. Run it manually first from the *Actions* tab — the
+`workflow_dispatch` trigger has a **dry run** checkbox that logs alerts instead
+of sending them.
+
+GitHub's scheduler is best-effort and can lag several minutes under load. A
+missed run means that candle is skipped, never a duplicate alert.
 
 ---
 

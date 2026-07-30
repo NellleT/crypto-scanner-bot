@@ -106,13 +106,14 @@ class Candle:
 def _is_bullish_engulfing(previous: Candle, current: Candle) -> bool:
     """Previous bar bearish, current bar bullish, current body engulfs previous.
 
-    Strict form: the current body must open strictly below the previous close
-    and close strictly above the previous open.
+    The open may sit *at* the previous close (``<=``); the close must strictly
+    exceed the previous open. See :func:`classify_engulfing` for why the open
+    side is inclusive.
     """
     return (
         previous.is_bearish
         and current.is_bullish
-        and current.open < previous.close
+        and current.open <= previous.close
         and current.close > previous.open
     )
 
@@ -120,13 +121,14 @@ def _is_bullish_engulfing(previous: Candle, current: Candle) -> bool:
 def _is_bearish_engulfing(previous: Candle, current: Candle) -> bool:
     """Previous bar bullish, current bar bearish, current body engulfs previous.
 
-    Strict form: the current body must open strictly above the previous close
-    and close strictly below the previous open.
+    The open may sit *at* the previous close (``>=``); the close must strictly
+    undercut the previous open. See :func:`classify_engulfing` for why the open
+    side is inclusive.
     """
     return (
         previous.is_bullish
         and current.is_bearish
-        and current.open > previous.close
+        and current.open >= previous.close
         and current.close < previous.open
     )
 
@@ -142,6 +144,30 @@ def classify_engulfing(
     Both candles must have a real body of at least ``min_body_ratio`` of their
     own high-low range; see :data:`DEFAULT_MIN_BODY_RATIO` for why. Pass ``0.0``
     to apply the engulfing inequalities with no quality filter at all.
+
+    **Why the open comparison is inclusive.** The textbook form requires the
+    signal candle to *gap* past the previous close (``open < prev.close`` for a
+    bullish setup). That encodes an assumption from session-based markets, and
+    it makes the rule depend on how a venue stitches its candles rather than on
+    price action. Measured over 999 4h candles per symbol:
+
+    ==========  ====================  =====================  ====================
+    Venue       ``open == prev``      Patterns, strict ``<``  Patterns, ``<=``
+    ==========  ====================  =====================  ====================
+    Bybit       100%                  **0**                   216-240
+    Binance     ~50%                  34-58                   151-177
+    ==========  ====================  =====================  ====================
+
+    Bybit publishes a continuous series where every candle opens exactly at the
+    previous close, so ``open < prev.close`` is unsatisfiable and the strict form
+    detects **nothing at all** — a silent, permanent dead end. The inclusive form
+    yields comparable counts on both venues, which is what a rule about price
+    action should do.
+
+    Containment still holds with equality: if ``open == prev.close`` and
+    ``close > prev.open``, the signal body spans the whole previous body. The
+    close comparison stays strict, because merely matching the previous open is
+    not engulfing it.
     """
     if previous.body_ratio < min_body_ratio or current.body_ratio < min_body_ratio:
         return None
