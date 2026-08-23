@@ -18,17 +18,11 @@ from typing import Final
 
 from scanner.config import Settings
 from scanner.exchange import MarketDataClient, MarketDataError
-from scanner.indicators import add_indicators, pandas_ta_backend
-from scanner.notifier import (
-    ConsoleNotifier,
-    Notifier,
-    TelegramNotifier,
-    align_decimals,
-    humanize_price,
-)
+from scanner.execution import ExecutionOrder, build_execution_order
+from scanner.notifier import ConsoleNotifier, Notifier, TelegramNotifier
 from scanner.strategy import (
-    EngulfingTrendStrategy,
     FilterStage,
+    OrderBlockStrategy,
     StrategyResult,
     TradeSignal,
 )
@@ -40,7 +34,7 @@ _MIN_SLEEP_SECONDS: Final[float] = 5.0
 
 
 class ScannerBot:
-    """Polls a set of symbols for engulfing patterns and dispatches alerts."""
+    """Polls a set of symbols for validated order blocks and dispatches alerts."""
 
     def __init__(
         self,
@@ -63,14 +57,12 @@ class ScannerBot:
 
         self._notifier: Notifier = notifier or self._build_notifier(settings)
 
-        self._strategy = EngulfingTrendStrategy(
-            sma_period=settings.sma_period,
-            volume_sma_period=settings.volume_sma_period,
+        self._strategy = OrderBlockStrategy(
             min_body_ratio=settings.min_body_ratio,
-            require_volume_expansion=settings.require_volume_expansion,
-            structural_lookback=settings.structural_lookback,
             stop_buffer_pct=settings.stop_buffer_pct,
-            rr_targets=settings.rr_targets,
+            reward_ratio=settings.reward_ratio,
+            account_equity=settings.account_equity,
+            risk_per_trade_pct=settings.risk_per_trade_pct,
         )
 
         self._timeframe_seconds = self._market_data.timeframe_seconds(settings.timeframe)
@@ -169,15 +161,9 @@ class ScannerBot:
         if self._latest_close_epoch is None or close_epoch > self._latest_close_epoch:
             self._latest_close_epoch = close_epoch
 
-        # Indicators are computed only after the still-forming candle has been
-        # dropped, so no moving average can repaint as that bar develops.
-        enriched = add_indicators(
-            df,
-            sma_period=self._settings.sma_period,
-            volume_sma_period=self._settings.volume_sma_period,
-        )
-
-        return self._strategy.evaluate(enriched, symbol, self._settings.timeframe)
+        # The frame holds only closed candles, so the gap that validates a block
+        # cannot appear and vanish while the newest bar is still developing.
+        return self._strategy.evaluate(df, symbol, self._settings.timeframe)
 
     def scan_once(self) -> list[TradeSignal]:
         """Run one full pass over all symbols, dispatching alerts as they are found."""
@@ -221,11 +207,15 @@ class ScannerBot:
         signal = result.signal
         assert signal is not None  # guaranteed by result.matched
 
-        if self._last_alerted.get(symbol) == signal.candle.timestamp:
-            logger.debug("%s: signal already reported for this candle.", symbol)
+        # Keyed on the order block candle, not the confirmation candle: the same
+        # block stays the newest structure for as long as price has not returned
+        # to it, and it must only be alerted once.
+        block_timestamp = signal.block.candle.timestamp
+        if self._last_alerted.get(symbol) == block_timestamp:
+            logger.debug("%s: order block already reported.", symbol)
             return None
 
-        self._last_alerted[symbol] = signal.candle.timestamp
+        self._last_alerted[symbol] = block_timestamp
         return signal
 
     def _log_funnel(self, funnel: Counter[str]) -> None:
@@ -246,36 +236,53 @@ class ScannerBot:
             or "nothing evaluated",
         )
 
+    def build_order(self, signal: TradeSignal) -> ExecutionOrder | None:
+        """Render a signal as a routable Binance order, or ``None`` if it cannot be.
+
+        Failing to format an order must not suppress the alert — a human can act
+        on the levels either way — so the error is logged and the alert still
+        goes out without the routing block.
+        """
+        try:
+            return build_execution_order(
+                signal.symbol,
+                signal.plan,
+                signal.block,
+                price_to_precision=self._market_data.price_to_precision,
+                amount_to_precision=self._market_data.amount_to_precision,
+            )
+        except (ValueError, TypeError) as exc:
+            logger.error("Could not build an execution order for %s: %s", signal.symbol, exc)
+            return None
+
     def _dispatch(self, result: TradeSignal) -> None:
-        price_text = self._market_data.price_to_precision(result.symbol, result.price)
-        sma_text = self._market_data.price_to_precision(result.symbol, result.trend_sma)
-        price = humanize_price(result.price, price_text)
+        plan = result.plan
+        order = self.build_order(result)
+
         logger.info(
-            "%s %s on %s %s @ %s | %s %s (%+.2f%%) | volume %.2fx average | engulf %.2fx",
+            "%s %s order block on %s %s | entry %s | SL %s (risk %.2f%%) | "
+            "TP 1:%g %s | qty %s | FVG %.2f%%",
             result.direction.emoji,
             result.direction.value,
             result.symbol,
             result.timeframe,
-            price,
-            f"SMA{result.trend_sma_period}",
-            align_decimals(result.trend_sma, sma_text, price),
-            result.sma_distance_pct,
-            result.volume_ratio,
-            result.engulf_ratio,
+            order.entry if order else f"{plan.entry:g}",
+            order.stop_loss if order else f"{plan.stop_loss:g}",
+            plan.risk_pct_of_entry,
+            plan.reward_ratio,
+            order.take_profit if order else f"{plan.take_profit:g}",
+            order.quantity if order else f"{plan.quantity:g}",
+            result.block.fvg.size_pct(plan.entry),
         )
+
         def to_precision(value: float) -> str | None:
             return self._market_data.price_to_precision(result.symbol, value)
 
-        if not self._notifier.send_signal(
-            result,
-            price_text=price_text,
-            sma_text=sma_text,
-            to_precision=to_precision,
-        ):
+        if not self._notifier.send_signal(result, order=order, to_precision=to_precision):
             logger.error("Failed to deliver alert for %s.", result.symbol)
-            # Clear the dedup marker so a pass that still sees this candle as the
-            # latest closed one (an error-backoff retry, or a restart before the
-            # next close) can re-send it. Once the candle rolls over the signal is
+            # Clear the dedup marker so a pass that still sees this structure as
+            # the newest one (an error-backoff retry, or a restart before the next
+            # close) can re-send it. Once the candle rolls over the signal is
             # intentionally abandoned rather than delivered late.
             self._last_alerted.pop(result.symbol, None)
 
@@ -305,24 +312,19 @@ class ScannerBot:
     def run_forever(self) -> None:
         """Scan on every candle close until interrupted. Never raises on scan errors."""
         logger.info("Scanner started — %s", self._settings.describe())
-        logger.info("Indicator backend: %s", pandas_ta_backend())
         logger.info(
-            "Candle duration %ds; alerts fire on the most recently CLOSED candle. "
-            "LONG needs close > SMA%d and volume > VOL_SMA_%d with a bullish engulfing; "
-            "SHORT is the mirror image.%s",
+            "Candle duration %ds; structures are read from the most recently CLOSED "
+            "candles. LONG needs a bearish block at [-3] before a bullish impulse at "
+            "[-2], validated by low[-1] > high[-3]; SHORT is the mirror image.",
             self._timeframe_seconds,
-            self._settings.sma_period,
-            self._settings.volume_sma_period,
-            " Volume must also expand over the engulfed candle (VSA)."
-            if self._settings.require_volume_expansion
-            else " VSA expansion check is DISABLED.",
         )
         logger.info(
-            "Stops anchor to the %d-bar structural %s with a %g%% buffer; targets at %s.",
-            self._settings.structural_lookback,
-            "low (long) / high (short)",
+            "Entry rests at the block's proximal edge; stop sits %g%% beyond the "
+            "distal edge; target at 1:%g. Size risks %g%% of %.2f equity.",
             self._settings.stop_buffer_pct,
-            ", ".join(f"1:{r:g}" for r in self._settings.rr_targets),
+            self._settings.reward_ratio,
+            self._settings.risk_per_trade_pct,
+            self._settings.account_equity,
         )
 
         while not self._stop_event.is_set():

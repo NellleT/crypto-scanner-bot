@@ -50,14 +50,17 @@ jobs:
           # Binance and Bybit both restrict the IP ranges GitHub's runners use,
           # so neither can serve market data here. Kraken is US-regulated and
           # does not geo-block them.
+          # WARNING: Binance restricts GitHub's runner IP ranges, so this
+          # workflow CANNOT fetch Binance data. Kraken is used here so the
+          # schedule keeps running, but v3.0 emits limit orders at exact
+          # order-block edges and Kraken prices those levels up to 1.3% away
+          # from Binance. Treat CI output as indicative only — run on a host
+          # Binance serves before routing anything.
           EXCHANGE_ID: kraken
           # Optional overrides. Unset secrets arrive as empty strings, which the
-          # config layer treats as "not set" and falls back to its defaults —
-          # BTC/USD,ETH/USD,SOL/USD. Kraken is a fiat-primary venue whose USD
-          # books carry ~19x the turnover of the matching USDT pairs, so if you
-          # DO set this secret, prefer USD pairs: two of the four filters are
-          # volume-based and thin USDT books make them measure noise.
+          # config layer treats as "not set" and falls back to its defaults.
           SYMBOLS: ${{ secrets.SYMBOLS }}
+          ACCOUNT_EQUITY: ${{ secrets.ACCOUNT_EQUITY }}
           TIMEFRAME: ${{ secrets.TIMEFRAME }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |

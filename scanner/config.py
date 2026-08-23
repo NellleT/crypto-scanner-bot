@@ -15,38 +15,47 @@ from typing import Final
 
 from dotenv import load_dotenv
 
-from scanner.indicators import (
-    DEFAULT_SMA_PERIOD,
-    DEFAULT_VOLUME_SMA_PERIOD,
-    required_candles,
-)
-from scanner.patterns import DEFAULT_MIN_BODY_RATIO
+from scanner.candles import DEFAULT_MIN_BODY_RATIO
+from scanner.execution import to_unified_symbol
 from scanner.risk import (
-    DEFAULT_RR_TARGETS,
+    DEFAULT_ACCOUNT_EQUITY,
+    DEFAULT_REWARD_RATIO,
+    DEFAULT_RISK_PER_TRADE_PCT,
     DEFAULT_STOP_BUFFER_PCT,
-    DEFAULT_STRUCTURAL_LOOKBACK,
 )
+from scanner.smc import STRUCTURE_LENGTH
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 
-#: Default venue. Both Binance and Bybit restrict the IP ranges GitHub Actions
-#: runners use, so a scheduled workflow cannot fetch candles from either.
-#: Kraken is US-regulated and serves those runners without geo-blocking.
-DEFAULT_EXCHANGE_ID: Final[str] = "kraken"
-
-#: Default watchlist, quoted in USD rather than USDT.
+#: Default venue — the one orders are executed on.
 #:
-#: Kraken is primarily a fiat venue: measured over 200 4h candles, its USD pairs
-#: carry a median **19.2x** the turnover of the matching USDT pair, and the thin
-#: USDT books print flat and zero-volume bars (DOT/USDT: ~$1.9k per 4h, 18 bars
-#: with high == low). Two of the four filters are volume-based, so that is the
-#: difference between measuring participation and measuring noise. The two feeds
-#: track within 0.07% at the median, so the trend and pattern logic sees the same
-#: market either way. On a USDT-primary venue (Binance, Bybit) use USDT pairs.
-DEFAULT_SYMBOLS: Final[tuple[str, ...]] = ("BTC/USD", "ETH/USD", "SOL/USD")
+#: v3.0 emits resting limit orders at exact order-block edges, so the levels
+#: must come from the book they will rest in. Kraken and Binance disagree by up
+#: to 1.3% on the thinner pairs; against a stop that is often ~1% wide, a level
+#: taken from the wrong venue either fills instantly or never fills.
+#:
+#: Binance restricts the IP ranges GitHub Actions runners use, so a scheduled
+#: workflow cannot reach it — v3.0 needs a host that Binance serves. Set
+#: EXCHANGE_ID=kraken to run from CI, accepting that the levels are indicative
+#: rather than executable.
+DEFAULT_EXCHANGE_ID: Final[str] = "binance"
 
-DEFAULT_TIMEFRAME: Final[str] = "4h"
-DEFAULT_CANDLE_LIMIT: Final[int] = 300
+#: Default execution watchlist.
+DEFAULT_SYMBOLS: Final[tuple[str, ...]] = (
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
+    "BNB/USDT",
+    "XRP/USDT",
+    "ADA/USDT",
+    "AVAX/USDT",
+)
+
+DEFAULT_TIMEFRAME: Final[str] = "1h"
+
+#: Only three candles are needed for a structure; the rest is context for
+#: diagnostics and backtesting helpers.
+DEFAULT_CANDLE_LIMIT: Final[int] = 200
 
 #: Upper bound accepted for CANDLE_LIMIT. Individual venues cap lower — Kraken
 #: returns at most ~720 candles — and :mod:`scanner.exchange` warns when a
@@ -130,32 +139,6 @@ def _get_bool(key: str, default: bool) -> bool:
     raise ConfigError(f"{key} must be a boolean-like value, got {raw!r}.")
 
 
-def parse_rr_targets(raw: str) -> tuple[float, ...]:
-    """Parse a comma-separated reward-to-risk ladder, e.g. ``2,3``.
-
-    Returned in ascending order so the alert always lists nearer targets first,
-    regardless of how they were written.
-    """
-    targets: list[float] = []
-    for chunk in raw.split(","):
-        token = chunk.strip()
-        if not token:
-            continue
-        try:
-            value = float(token)
-        except ValueError as exc:
-            raise ConfigError(
-                f"RR_TARGETS must be a comma-separated list of numbers, got {token!r}."
-            ) from exc
-        if value <= 0.0:
-            raise ConfigError(f"RR_TARGETS entries must be > 0, got {value:g}.")
-        targets.append(value)
-
-    if not targets:
-        raise ConfigError("RR_TARGETS resolved to an empty list.")
-    return tuple(sorted(set(targets)))
-
-
 def validate_timeframe_token(timeframe: str) -> str:
     """Return ``timeframe`` if it is a well-formed token, else raise ``ConfigError``.
 
@@ -171,17 +154,23 @@ def validate_timeframe_token(timeframe: str) -> str:
 
 
 def parse_symbols(raw: str) -> tuple[str, ...]:
-    """Parse a comma-separated symbol list, preserving order and de-duplicating."""
+    """Parse a comma-separated symbol list into CCXT unified form.
+
+    Accepts both the exchange-native spelling used by the Binance API
+    (``BTCUSDT``) and the unified form CCXT needs (``BTC/USDT``), because the
+    execution watchlist is naturally written the first way and the market-data
+    layer requires the second. Order is preserved and duplicates collapse — so
+    ``BTCUSDT`` and ``BTC/USDT`` in one list resolve to a single entry.
+    """
     seen: dict[str, None] = {}
     for chunk in raw.split(","):
-        symbol = chunk.strip().upper()
-        if not symbol:
+        token = chunk.strip().upper()
+        if not token:
             continue
-        if "/" not in symbol:
-            raise ConfigError(
-                f"Symbol {symbol!r} must use CCXT unified format, e.g. 'BTC/USDT'."
-            )
-        seen.setdefault(symbol, None)
+        try:
+            seen.setdefault(to_unified_symbol(token), None)
+        except ValueError as exc:
+            raise ConfigError(f"Cannot parse symbol {token!r}: {exc}") from exc
     if not seen:
         raise ConfigError("SYMBOLS resolved to an empty list.")
     return tuple(seen)
@@ -197,13 +186,11 @@ class Settings:
     timeframe: str
     exchange_id: str
     candle_limit: int
-    sma_period: int
-    volume_sma_period: int
     min_body_ratio: float
-    require_volume_expansion: bool
-    structural_lookback: int
     stop_buffer_pct: float
-    rr_targets: tuple[float, ...]
+    reward_ratio: float
+    account_equity: float
+    risk_per_trade_pct: float
     poll_buffer_seconds: float
     request_delay_seconds: float
     max_retries: int
@@ -240,37 +227,11 @@ class Settings:
 
         symbols_raw = _get_str("SYMBOLS", ",".join(DEFAULT_SYMBOLS))
 
-        sma_period = _get_int("SMA_PERIOD", DEFAULT_SMA_PERIOD, minimum=2, maximum=1000)
-        volume_sma_period = _get_int(
-            "VOLUME_SMA_PERIOD", DEFAULT_VOLUME_SMA_PERIOD, minimum=2, maximum=1000
-        )
-        structural_lookback = _get_int(
-            "STRUCTURAL_LOOKBACK", DEFAULT_STRUCTURAL_LOOKBACK, minimum=2, maximum=1000
-        )
         candle_limit = _get_int(
             "CANDLE_LIMIT",
             DEFAULT_CANDLE_LIMIT,
-            minimum=3,
+            minimum=STRUCTURE_LENGTH + 1,
             maximum=MAX_CANDLE_LIMIT,
-        )
-
-        # The newest bar in a response is usually still forming and gets dropped
-        # before analysis, so one extra candle must be fetched on top of what the
-        # indicators and the structural lookback need.
-        minimum_limit = (
-            max(required_candles(sma_period, volume_sma_period), structural_lookback) + 1
-        )
-        if candle_limit < minimum_limit:
-            raise ConfigError(
-                f"CANDLE_LIMIT={candle_limit} is too small for SMA_PERIOD={sma_period}, "
-                f"VOLUME_SMA_PERIOD={volume_sma_period} and "
-                f"STRUCTURAL_LOOKBACK={structural_lookback}: at least {minimum_limit} "
-                "candles are required, otherwise every signal is discarded as "
-                "not-warmed-up. Raise CANDLE_LIMIT or lower the periods."
-            )
-
-        rr_targets = parse_rr_targets(
-            _get_str("RR_TARGETS", ",".join(f"{r:g}" for r in DEFAULT_RR_TARGETS))
         )
 
         log_file_raw = _get_str("LOG_FILE")
@@ -286,23 +247,30 @@ class Settings:
             timeframe=timeframe,
             exchange_id=_get_str("EXCHANGE_ID", DEFAULT_EXCHANGE_ID).lower(),
             candle_limit=candle_limit,
-            sma_period=sma_period,
-            volume_sma_period=volume_sma_period,
             min_body_ratio=_get_float(
                 "MIN_BODY_RATIO",
                 DEFAULT_MIN_BODY_RATIO,
                 minimum=0.0,
                 maximum=1.0,
             ),
-            require_volume_expansion=_get_bool("REQUIRE_VOLUME_EXPANSION", True),
-            structural_lookback=structural_lookback,
             stop_buffer_pct=_get_float(
                 "STOP_BUFFER_PCT",
                 DEFAULT_STOP_BUFFER_PCT,
                 minimum=0.0,
                 maximum=10.0,
             ),
-            rr_targets=rr_targets,
+            reward_ratio=_get_float(
+                "REWARD_RATIO", DEFAULT_REWARD_RATIO, minimum=0.1, maximum=100.0
+            ),
+            account_equity=_get_float(
+                "ACCOUNT_EQUITY", DEFAULT_ACCOUNT_EQUITY, minimum=0.01
+            ),
+            risk_per_trade_pct=_get_float(
+                "RISK_PER_TRADE_PCT",
+                DEFAULT_RISK_PER_TRADE_PCT,
+                minimum=0.001,
+                maximum=100.0,
+            ),
             poll_buffer_seconds=_get_float("POLL_BUFFER_SECONDS", 10.0, minimum=0.0),
             request_delay_seconds=_get_float("REQUEST_DELAY_SECONDS", 0.25, minimum=0.0),
             max_retries=_get_int("MAX_RETRIES", 3, minimum=0),
@@ -319,11 +287,10 @@ class Settings:
             f"exchange={self.exchange_id} "
             f"timeframe={self.timeframe} "
             f"symbols={len(self.symbols)} ({', '.join(self.symbols)}) "
-            f"sma={self.sma_period} vol_sma={self.volume_sma_period} "
             f"min_body_ratio={self.min_body_ratio:g} "
-            f"vsa_expansion={self.require_volume_expansion} "
             f"candles={self.candle_limit} "
-            f"stop={self.structural_lookback}-bar±{self.stop_buffer_pct:g}% "
-            f"targets={'/'.join(f'1:{r:g}' for r in self.rr_targets)} "
+            f"stop=distal±{self.stop_buffer_pct:g}% "
+            f"target=1:{self.reward_ratio:g} "
+            f"risk={self.risk_per_trade_pct:g}% of {self.account_equity:,.2f} "
             f"dry_run={self.dry_run}"
         )

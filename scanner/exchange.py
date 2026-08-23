@@ -15,7 +15,7 @@ from typing import Any, Callable, Final, TypeVar
 import ccxt
 import pandas as pd
 
-from scanner.patterns import REQUIRED_COLUMNS
+from scanner.candles import REQUIRED_COLUMNS
 
 logger: Final[logging.Logger] = logging.getLogger(__name__)
 
@@ -245,6 +245,20 @@ class MarketDataClient:
             return None
         try:
             return str(self._exchange.price_to_precision(symbol, price))
+        except Exception:  # unknown symbol or missing precision metadata
+            return None
+
+    def amount_to_precision(self, symbol: str, amount: float) -> str | None:
+        """Format ``amount`` using the venue's lot size, or ``None`` if unknown.
+
+        Position sizing produces an arbitrary float; venues reject quantities
+        that violate their step size, so an order must be rounded to the lot
+        before it is routed.
+        """
+        if not self._markets_loaded:
+            return None
+        try:
+            return str(self._exchange.amount_to_precision(symbol, amount))
         except Exception:  # unknown symbol or missing precision metadata
             return None
 

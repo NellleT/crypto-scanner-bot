@@ -1,64 +1,74 @@
-"""Crypto Scanner Bot — multi-factor engulfing scanner for crypto spot markets.
+"""Crypto Scanner Bot — Smart Money Concepts scanner for crypto spot markets.
 
-Signals require an engulfing reversal to agree with the SMA-200 trend regime and
-be backed by volume that is both above its own average and expanding over the
-candle being engulfed. Each confirmed signal carries a risk plan
-whose stop anchors to the recent structural extreme rather than to the signal
-candle, to sit beyond the obvious pool of resting stops.
+v3.0 retires the v2.x engulfing/SMA/volume chain. A signal now requires an
+order block — the last opposing candle before a displacement — validated by the
+fair value gap that displacement left behind. Each validated block produces a
+resting limit order at its proximal edge, a stop beyond its distal edge, a fixed
+R-multiple target, and a size derived from a fixed fraction of account equity.
 """
 
 from __future__ import annotations
 
+from scanner.candles import DEFAULT_MIN_BODY_RATIO, Candle, validate_ohlcv
 from scanner.config import Settings
-from scanner.indicators import (
-    DEFAULT_SMA_PERIOD,
-    DEFAULT_VOLUME_SMA_PERIOD,
-    add_indicators,
-    required_candles,
-)
-from scanner.patterns import (
-    DEFAULT_MIN_BODY_RATIO,
-    Candle,
-    PatternType,
-    classify_engulfing,
+from scanner.execution import (
+    ExecutionOrder,
+    build_execution_order,
+    to_binance_symbol,
+    to_unified_symbol,
 )
 from scanner.risk import (
-    DEFAULT_RR_TARGETS,
+    DEFAULT_ACCOUNT_EQUITY,
+    DEFAULT_REWARD_RATIO,
+    DEFAULT_RISK_PER_TRADE_PCT,
     DEFAULT_STOP_BUFFER_PCT,
-    DEFAULT_STRUCTURAL_LOOKBACK,
-    RiskPlan,
-    TakeProfit,
-    build_risk_plan,
+    TradePlan,
+    build_trade_plan,
+    position_size,
+)
+from scanner.smc import (
+    STRUCTURE_LENGTH,
+    Direction,
+    FairValueGap,
+    OrderBlock,
+    detect_order_block,
+    fvg_frame,
+    order_block_mask,
 )
 from scanner.strategy import (
-    EngulfingTrendStrategy,
     FilterStage,
-    SignalDirection,
+    OrderBlockStrategy,
     StrategyResult,
     TradeSignal,
 )
 
 __all__ = [
+    "DEFAULT_ACCOUNT_EQUITY",
     "DEFAULT_MIN_BODY_RATIO",
-    "DEFAULT_RR_TARGETS",
-    "DEFAULT_SMA_PERIOD",
+    "DEFAULT_REWARD_RATIO",
+    "DEFAULT_RISK_PER_TRADE_PCT",
     "DEFAULT_STOP_BUFFER_PCT",
-    "DEFAULT_STRUCTURAL_LOOKBACK",
-    "DEFAULT_VOLUME_SMA_PERIOD",
+    "STRUCTURE_LENGTH",
     "Candle",
-    "EngulfingTrendStrategy",
+    "Direction",
+    "ExecutionOrder",
+    "FairValueGap",
     "FilterStage",
-    "PatternType",
-    "RiskPlan",
+    "OrderBlock",
+    "OrderBlockStrategy",
     "Settings",
-    "SignalDirection",
     "StrategyResult",
-    "TakeProfit",
+    "TradePlan",
     "TradeSignal",
-    "add_indicators",
-    "build_risk_plan",
-    "classify_engulfing",
-    "required_candles",
+    "build_execution_order",
+    "build_trade_plan",
+    "detect_order_block",
+    "fvg_frame",
+    "order_block_mask",
+    "position_size",
+    "to_binance_symbol",
+    "to_unified_symbol",
+    "validate_ohlcv",
 ]
 
-__version__ = "2.2.0"
+__version__ = "3.0.0"

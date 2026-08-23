@@ -1,8 +1,7 @@
-"""Crypto Scanner Bot v2 — entrypoint.
+"""Crypto Scanner Bot v3.0 (Smart Money Concepts) — entrypoint.
 
-Monitors a configurable set of USDT pairs (Bybit by default) and sends an alert
-when an engulfing reversal closes *in agreement with* the SMA-200 trend regime
-and on above-average volume.
+Monitors a configurable set of pairs for order blocks validated by fair value
+gaps, and emits a fully sized pending limit order for each one.
 
 Usage::
 
@@ -36,8 +35,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="crypto-scanner",
         description=(
-            "Scan exchange pairs for engulfing reversals confirmed by the SMA-200 "
-            "trend regime and above-average volume."
+            "Scan for Smart Money order blocks validated by fair value gaps, "
+            "sized to a fixed fraction of account equity."
         ),
     )
     parser.add_argument(

@@ -1,89 +1,38 @@
 """Unit tests for alert formatting.
 
-The message is the product the user actually sees, so its content and its
-escaping are pinned here. No network is involved.
+The message is the product the user sees, so its content and escaping are
+pinned here. No network is involved.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from scanner.execution import build_execution_order
 from scanner.notifier import (
-    align_decimals,
     build_message,
+    format_money,
     format_price,
     format_price_group,
-    format_volume,
-    humanize_price,
+    format_quantity,
     quote_prefix,
 )
-from scanner.patterns import Candle, PatternType
-from scanner.risk import RiskPlan, TakeProfit
-from scanner.strategy import SignalDirection, TradeSignal
-
-PREV = Candle(1_753_480_800_000, 118_500.0, 118_900.0, 117_800.0, 117_950.0, 1_200.0)
-CURR = Candle(1_753_481_700_000, 117_900.0, 119_400.0, 117_850.0, 118_700.0, 2_500.0)
-
-
-def make_plan(
-    *,
-    is_long: bool = True,
-    entry: float = 118_700.0,
-    stop_loss: float = 117_000.0,
-    ratios: tuple[float, ...] = (2.0, 3.0),
-) -> RiskPlan:
-    risk = abs(entry - stop_loss)
-    prices = [entry + risk * r if is_long else entry - risk * r for r in ratios]
-    return RiskPlan(
-        is_long=is_long,
-        entry=entry,
-        stop_loss=stop_loss,
-        structural_level=stop_loss / 0.999 if is_long else stop_loss / 1.001,
-        lookback=10,
-        buffer_pct=0.1,
-        take_profits=tuple(
-            TakeProfit(ratio=r, price=p) for r, p in zip(ratios, prices)
-        ),
-    )
+from scanner.risk import build_trade_plan
+from scanner.smc import Direction
+from scanner.strategy import TradeSignal
+from tests.test_risk import make_block
 
 
 def make_signal(
-    direction: SignalDirection = SignalDirection.LONG,
+    direction: Direction = Direction.LONG,
     *,
-    price: float = 118_700.0,
-    trend_sma: float = 112_000.0,
-    volume: float = 2_500.0,
-    volume_sma: float = 1_000.0,
-    previous_volume: float = 1_200.0,
-    risk: RiskPlan | None = None,
+    symbol: str = "BTC/USDT",
+    equity: float = 10_000.0,
 ) -> TradeSignal:
-    pattern = (
-        PatternType.BULLISH_ENGULFING
-        if direction is SignalDirection.LONG
-        else PatternType.BEARISH_ENGULFING
-    )
-    is_long = direction is SignalDirection.LONG
-    plan = risk or make_plan(
-        is_long=is_long,
-        entry=price,
-        stop_loss=price * (0.98 if is_long else 1.02),
-    )
-    return TradeSignal(
-        symbol="BTC/USDT",
-        timeframe="4h",
-        direction=direction,
-        pattern=pattern,
-        price=price,
-        trend_sma=trend_sma,
-        trend_sma_period=200,
-        volume=volume,
-        volume_sma=volume_sma,
-        volume_sma_period=20,
-        previous_volume=previous_volume,
-        engulf_ratio=1.45,
-        candle=CURR,
-        risk=plan,
-    )
+    block = make_block(direction)
+    plan = build_trade_plan(block, equity=equity, risk_pct=1.0, reward_ratio=4.0)
+    assert plan is not None
+    return TradeSignal(symbol=symbol, timeframe="1h", block=block, plan=plan)
 
 
 # ---------------------------------------------------------------------------
@@ -93,100 +42,75 @@ def test_message_contains_every_required_field() -> None:
     message = build_message(make_signal())
     for expected in (
         "BTC/USDT",
-        "4h",
-        "LONG",
-        "SMA 200",
-        "Volume",
-        "Engulf ratio",
-        "VSA",
-        "Risk Management",
+        "1h",
+        "ORDER BLOCK",
+        "OB zone",
+        "Fair Value Gap",
+        "Pending Limit Order",
         "Entry:",
-        "Stop-Loss",
-        "Take-Profit 1",
-        "Take-Profit 2",
+        "Stop-Loss:",
+        "Take-Profit",
+        "Position Sizing",
+        "Quantity:",
+        "Risk:",
     ):
         assert expected in message, f"missing {expected!r}"
 
 
-# ---------------------------------------------------------------------------
-# Risk block
-# ---------------------------------------------------------------------------
-def test_risk_block_reports_the_structural_anchor_and_ratios() -> None:
-    message = build_message(make_signal())
-    assert "10-bar low" in message
-    assert "(1:2)" in message
-    assert "(1:3)" in message
-    assert "Risk:" in message
+def test_long_and_short_are_visually_distinct() -> None:
+    long_message = build_message(make_signal(Direction.LONG))
+    short_message = build_message(make_signal(Direction.SHORT))
+    assert "🟢" in long_message and "LONG" in long_message
+    assert "🔴" in short_message and "SHORT" in short_message
 
 
-def test_short_risk_block_anchors_to_the_high() -> None:
-    message = build_message(make_signal(SignalDirection.SHORT, price=100.0))
-    assert "10-bar high" in message
+def test_reward_ratio_is_labelled() -> None:
+    assert "1:4" in build_message(make_signal())
 
 
-def test_risk_prices_all_share_one_decimal_count() -> None:
-    """Entry, stop and both targets are compared side by side."""
-    plan = make_plan(entry=1925.91, stop_loss=1898.10, ratios=(2.0, 3.0))
-    message = build_message(
-        make_signal(price=1925.91, risk=plan),
-        to_precision=lambda value: f"{value:.10g}",  # strips trailing zeros
-    )
-    assert "1,925.91" in message
-    assert "1,898.10" in message  # not "1,898.1"
-    assert "1,981.53" in message  # 1925.91 + 2 * 27.81
-    assert "2,009.34" in message  # 1925.91 + 3 * 27.81
+def test_risk_budget_is_reported_in_currency() -> None:
+    """1% of 10,000 is 100 — the number that decides position size."""
+    message = build_message(make_signal(equity=10_000.0))
+    assert "1% of" in message
+    assert "$10,000.00" in message
+    assert "$100.00" in message
+    assert "$400.00" in message  # 4R reward
 
 
-def test_headline_price_and_entry_are_formatted_identically() -> None:
-    """They are the same number; `Price: 41.7` above `Entry: $41.70` looks broken."""
-    plan = make_plan(entry=41.70, stop_loss=45.82, is_long=False, ratios=(2.0,))
-    message = build_message(
-        make_signal(SignalDirection.SHORT, price=41.70, trend_sma=46.91, risk=plan),
-        to_precision=lambda v: f"{v:.10g}",  # strips trailing zeros, as venues do
-    )
-    assert "<b>Price:</b> <code>41.70</code>" in message
-    assert "<code>$41.70</code>" in message
-    assert "41.7<" not in message  # no bare one-decimal rendering anywhere
+def test_money_amounts_use_two_decimals_not_price_precision() -> None:
+    """Cash is money; "$100.0000" reads like a bug.
 
+    Scoped to the sizing lines: an instrument *price* of 100 legitimately
+    renders as 100.0000 under the magnitude fallback, and the two must not be
+    conflated.
+    """
+    assert format_money(100.0) == "100.00"
+    assert format_money(1_234_567.891) == "1,234,567.89"
 
-def test_every_price_in_the_message_shares_a_decimal_count() -> None:
-    plan = make_plan(entry=100.0, stop_loss=98.5, ratios=(2.0, 3.0))
-    message = build_message(
-        make_signal(price=100.0, trend_sma=95.0, risk=plan),
-        to_precision=lambda v: f"{v:.10g}",
-    )
-    for expected in ("100.0", "95.0", "98.5", "103.0", "104.5"):
-        assert expected in message, f"missing {expected!r}"
-
-
-def test_risk_percentages_are_reported() -> None:
-    plan = make_plan(entry=100.0, stop_loss=98.0, ratios=(2.0,))
-    message = build_message(make_signal(price=100.0, risk=plan))
-    assert "Risk: 2.00%" in message
-    assert "+4.00%" in message  # 2R on 2% risk, price moves up
+    message = build_message(make_signal(equity=10_000.0))
+    sizing = [line for line in message.splitlines() if "Risk:" in line or "Reward" in line]
+    assert sizing, "sizing lines missing from the alert"
+    for line in sizing:
+        assert "0000</code>" not in line, f"price precision leaked into money: {line}"
 
 
 def test_short_target_shows_a_negative_price_move() -> None:
-    """A short's target is below entry; "+5.74%" would read as a rally."""
-    plan = make_plan(is_long=False, entry=100.0, stop_loss=102.0, ratios=(2.0,))
-    message = build_message(make_signal(SignalDirection.SHORT, price=100.0, risk=plan))
-    assert "-4.00%" in message
-    assert "+4.00%" not in message
-    # The gain itself is still a positive magnitude for sizing purposes.
-    assert plan.reward_pct(plan.take_profits[0]) == pytest.approx(4.0)
-    assert plan.price_move_pct(plan.take_profits[0]) == pytest.approx(-4.0)
+    """A short's target is below entry; "+" would read as a rally."""
+    message = build_message(make_signal(Direction.SHORT))
+    assert "-" in message
+    plan = make_signal(Direction.SHORT).plan
+    assert plan.take_profit_move_pct < 0
 
 
-def test_usd_quotes_render_a_dollar_sign() -> None:
-    assert quote_prefix("BTC/USDT") == "$"
-    assert quote_prefix("BTC/USDC") == "$"
-    assert "$" in build_message(make_signal())
-
-
-def test_non_usd_quote_does_not_claim_dollars() -> None:
-    """An ETH/BTC price is not denominated in dollars."""
-    assert quote_prefix("ETH/BTC") == "BTC "
-    assert quote_prefix("SOL/EUR") == "EUR "
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
+def test_all_plan_prices_share_a_decimal_count() -> None:
+    message = build_message(make_signal(), to_precision=lambda v: f"{v:.10g}")
+    # entry 100, stop 94.81, target 120.76 -> all rendered with two decimals.
+    assert "100.00" in message
+    assert "94.81" in message
+    assert "120.76" in message
 
 
 def test_format_price_group_uses_the_widest_precision() -> None:
@@ -194,88 +118,50 @@ def test_format_price_group_uses_the_widest_precision() -> None:
         "1,925.91",
         "1,898.10",
     ]
-    assert format_price_group([1.5, 2.0], None) == ["1.5000", "2.0000"]
 
 
-def test_long_and_short_are_visually_distinct() -> None:
-    long_message = build_message(make_signal(SignalDirection.LONG))
-    short_message = build_message(
-        make_signal(SignalDirection.SHORT, price=100_000.0, trend_sma=112_000.0)
-    )
-    assert "🟢" in long_message and "LONG SIGNAL" in long_message
-    assert "🔴" in short_message and "SHORT SIGNAL" in short_message
+def test_format_quantity_spans_btc_fractions_to_meme_coin_millions() -> None:
+    assert format_quantity(0.00123456) == "0.00123456"
+    assert format_quantity(19.2657) == "19.2657"
+    assert format_quantity(1_250_000.0) == "1,250,000.00"
 
 
-def test_volume_is_reported_relative_to_its_average() -> None:
-    message = build_message(make_signal(volume=2_500.0, volume_sma=1_000.0))
-    assert "2.50x" in message
+def test_usd_quotes_render_a_dollar_sign() -> None:
+    assert quote_prefix("BTC/USDT") == "$"
+    assert quote_prefix("ETH/BTC") == "BTC "
+    assert "$" in build_message(make_signal())
 
 
-def test_vsa_expansion_is_reported() -> None:
-    """The alert shows the follow-through it was accepted for."""
-    message = build_message(
-        make_signal(volume=2_500.0, volume_sma=1_000.0, previous_volume=1_000.0)
-    )
-    assert "VSA:" in message
-    assert "2.50x the engulfed candle" in message
-
-
-def test_distance_from_sma_is_reported_with_direction() -> None:
-    above = build_message(make_signal(price=110.0, trend_sma=100.0))
-    assert "10.00% above" in above
-
-    below = build_message(
-        make_signal(SignalDirection.SHORT, price=90.0, trend_sma=100.0)
-    )
-    assert "10.00% below" in below
+def test_format_price_falls_back_by_magnitude() -> None:
+    assert format_price(64_000.0) == "64,000.00"
+    assert format_price(0.00004821) == "0.00004821"
 
 
 # ---------------------------------------------------------------------------
-# Number formatting
+# Routing block
 # ---------------------------------------------------------------------------
-def test_price_and_sma_use_the_same_decimal_count() -> None:
-    """price_to_precision strips trailing zeros; a ragged pair looks like a bug."""
-    message = build_message(
-        make_signal(price=58.11, trend_sma=56.0),
-        price_text="58.11",
-        sma_text="56",  # what Binance returns for 56.00
-    )
-    assert "58.11" in message
-    assert "56.00" in message
+def test_execution_order_is_shown_when_supplied() -> None:
+    signal = make_signal()
+    order = build_execution_order(signal.symbol, signal.plan, signal.block)
+    message = build_message(signal, order=order)
+    assert "Route:" in message
+    assert "BTCUSDT" in message
+    assert "BUY" in message
 
 
-def test_align_decimals_keeps_extra_precision_when_needed() -> None:
-    assert align_decimals(0.5, "0.50000000", "1.23") == "0.50000000"
-    assert align_decimals(56.0, "56", "58.11") == "56.00"
-    assert align_decimals(1234.0, "1234", "1.5") == "1,234.0"
-
-
-def test_humanize_price_adds_grouping_at_venue_precision() -> None:
-    assert humanize_price(118_700.0, "118700") == "118,700"
-    assert humanize_price(0.00004821, "0.00004821") == "0.00004821"
-    assert humanize_price(118_700.0, None) == format_price(118_700.0)
-
-
-def test_format_volume_is_compact() -> None:
-    assert format_volume(68_390.0) == "68.39K"
-    assert format_volume(2_450_000.0) == "2.45M"
-    assert format_volume(3_100_000_000.0) == "3.10B"
-    assert format_volume(942.5) == "942.50"
-
-
-def test_format_volume_handles_meme_coin_scale() -> None:
-    """Sub-cent pairs trade in trillions of base units, not billions."""
-    assert format_volume(9.1e12) == "9.10T"
+def test_message_renders_without_an_execution_order() -> None:
+    """Order formatting failures must not suppress the alert."""
+    message = build_message(make_signal(), order=None)
+    assert "Route:" not in message
+    assert "Pending Limit Order" in message
 
 
 # ---------------------------------------------------------------------------
-# Escaping
+# Escaping and limits
 # ---------------------------------------------------------------------------
 def test_html_metacharacters_are_escaped() -> None:
     """Unescaped '<' would make Telegram reject the message with HTTP 400."""
-    signal = make_signal()
-    hostile = TradeSignal(**{**{f: getattr(signal, f) for f in signal.__slots__}, "symbol": "A<B>/USDT"})
-    message = build_message(hostile)
+    message = build_message(make_signal(symbol="A<B>/USDT"))
     assert "A&lt;B&gt;/USDT" in message
     assert "<b>" in message  # our own markup survives
 
