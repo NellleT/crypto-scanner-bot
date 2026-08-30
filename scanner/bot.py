@@ -1,8 +1,17 @@
 """Scanner orchestration.
 
-Owns the scan/sleep cycle, per-candle deduplication and graceful shutdown. The
-loop is designed so that a failure scanning one symbol never aborts the pass,
-and a failure of an entire pass never terminates the process.
+Owns the scan/sleep cycle, the multi-timeframe state machine and graceful
+shutdown. One pass is four phases:
+
+1. **Fetch** — HTF candles for every symbol, concurrently.
+2. **Advance** — replay the new HTF candles against every live zone, tagging
+   the ones price returned to and killing the ones that died.
+3. **Detect** — evaluate the newest HTF structure and admit new zones.
+4. **Confirm** — for tagged zones only, fetch the LTF and look for a change of
+   character; that, and only that, produces an order.
+
+A failure scanning one symbol never aborts the pass, and a failure of an entire
+pass never terminates the process.
 """
 
 from __future__ import annotations
@@ -16,16 +25,16 @@ from collections import Counter
 from types import FrameType
 from typing import Final
 
+import pandas as pd
+
+from scanner.analytics import SimulationReport, simulate
 from scanner.config import Settings
 from scanner.exchange import MarketDataClient, MarketDataError
 from scanner.execution import ExecutionOrder, build_execution_order
+from scanner.mtf import LtfTrigger, confirm_entry
 from scanner.notifier import ConsoleNotifier, Notifier, TelegramNotifier
-from scanner.strategy import (
-    FilterStage,
-    OrderBlockStrategy,
-    StrategyResult,
-    TradeSignal,
-)
+from scanner.strategy import FilterStage, OrderBlockStrategy, StrategyResult, TradeSignal
+from scanner.watchlist import WatchedZone, Watchlist, WatchState
 
 logger: Final[logging.Logger] = logging.getLogger(__name__)
 
@@ -34,7 +43,7 @@ _MIN_SLEEP_SECONDS: Final[float] = 5.0
 
 
 class ScannerBot:
-    """Polls a set of symbols for validated order blocks and dispatches alerts."""
+    """Polls for extreme order blocks and confirms entries on a lower timeframe."""
 
     def __init__(
         self,
@@ -59,18 +68,27 @@ class ScannerBot:
 
         self._strategy = OrderBlockStrategy(
             min_body_ratio=settings.min_body_ratio,
+            min_fvg_pct=settings.min_fvg_pct,
+            range_lookback=settings.range_lookback,
+            require_extreme=settings.require_extreme,
             stop_buffer_pct=settings.stop_buffer_pct,
+            max_stop_pct=settings.max_stop_pct,
             reward_ratio=settings.reward_ratio,
             account_equity=settings.account_equity,
             risk_per_trade_pct=settings.risk_per_trade_pct,
         )
 
+        self._max_zone_age_ms: int | None = (
+            int(settings.max_zone_age_hours * 3_600_000)
+            if settings.max_zone_age_hours > 0
+            else None
+        )
+        self._watchlist = Watchlist.load(
+            settings.watchlist_file, max_age_ms=self._max_zone_age_ms
+        )
+
         self._timeframe_seconds = self._market_data.timeframe_seconds(settings.timeframe)
         self._symbols: tuple[str, ...] = settings.symbols
-
-        # symbol -> open timestamp (ms) of the last candle we alerted on.
-        self._last_alerted: dict[str, int] = {}
-        # Close time (epoch seconds) of the newest closed candle we have seen.
         self._latest_close_epoch: float | None = None
 
     def _build_notifier(self, settings: Settings) -> Notifier:
@@ -100,12 +118,12 @@ class ScannerBot:
             try:
                 signal.signal(sig, _handle)
             except (ValueError, OSError, AttributeError):
-                # Not on the main thread, or unsupported on this platform.
                 logger.debug("Could not install handler for signal %s.", sig)
 
     def startup_checks(self) -> None:
-        """Validate exchange, timeframe, symbols and notifier before looping."""
+        """Validate exchange, timeframes, symbols and notifier before looping."""
         self._market_data.validate_timeframe(self._settings.timeframe)
+        self._market_data.validate_timeframe(self._settings.ltf_timeframe)
 
         try:
             supported = self._market_data.filter_supported_symbols(self._settings.symbols)
@@ -130,161 +148,310 @@ class ScannerBot:
             )
 
     def close(self) -> None:
+        self.save_watchlist()
         for resource in (self._notifier, self._market_data):
             closer = getattr(resource, "close", None)
             if callable(closer):
                 closer()
 
+    def save_watchlist(self) -> None:
+        """Persist zone state; a failure here must not lose the scan."""
+        try:
+            self._watchlist.prune()
+            self._watchlist.save(self._settings.watchlist_file)
+        except OSError as exc:
+            logger.error("Could not save the watchlist: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Fetching
+    # ------------------------------------------------------------------
+    def fetch_htf(self) -> dict[str, pd.DataFrame]:
+        """HTF candles for every symbol, fetched concurrently."""
+        jobs = [
+            (symbol, self._settings.timeframe, self._settings.candle_limit)
+            for symbol in self._symbols
+        ]
+        frames = self._market_data.fetch_many(
+            jobs, max_workers=self._settings.max_workers
+        )
+        return {
+            symbol: frame
+            for (symbol, _tf), frame in frames.items()
+            if not frame.empty
+        }
+
+    def fetch_ltf(self, symbols: list[str]) -> dict[str, pd.DataFrame]:
+        """LTF candles, fetched only for symbols with a tagged zone."""
+        if not symbols:
+            return {}
+        jobs = [
+            (symbol, self._settings.ltf_timeframe, self._settings.ltf_candle_limit)
+            for symbol in symbols
+        ]
+        frames = self._market_data.fetch_many(
+            jobs, max_workers=self._settings.max_workers
+        )
+        return {
+            symbol: frame
+            for (symbol, _tf), frame in frames.items()
+            if not frame.empty
+        }
+
     # ------------------------------------------------------------------
     # Scanning
     # ------------------------------------------------------------------
-    def scan_symbol(self, symbol: str) -> StrategyResult | None:
-        """Evaluate one symbol's most recently closed candle.
-
-        Returns the full :class:`StrategyResult` — including the stage at which
-        a rejection occurred — or ``None`` when market data was unavailable.
-        Deduplication and dispatch are handled by the caller.
-        """
-        try:
-            df = self._market_data.fetch_ohlcv(
-                symbol, self._settings.timeframe, self._settings.candle_limit
-            )
-        except MarketDataError as exc:
-            logger.error("Skipping %s: %s", symbol, exc)
-            return None
-
-        if df.empty:
-            return None
-
-        # Track the newest closed candle so sleeps stay anchored to the venue's grid.
+    def scan_symbol(self, symbol: str, df: pd.DataFrame) -> StrategyResult:
+        """Evaluate one symbol's newest closed HTF candles."""
         close_epoch = (int(df["timestamp"].iloc[-1]) / 1000.0) + self._timeframe_seconds
         if self._latest_close_epoch is None or close_epoch > self._latest_close_epoch:
             self._latest_close_epoch = close_epoch
-
-        # The frame holds only closed candles, so the gap that validates a block
-        # cannot appear and vanish while the newest bar is still developing.
         return self._strategy.evaluate(df, symbol, self._settings.timeframe)
 
-    def scan_once(self) -> list[TradeSignal]:
-        """Run one full pass over all symbols, dispatching alerts as they are found."""
-        found: list[TradeSignal] = []
+    def scan_once(self) -> list[LtfTrigger]:
+        """Run one full multi-timeframe pass, dispatching confirmed entries."""
         funnel: Counter[str] = Counter()
+        triggers: list[LtfTrigger] = []
 
-        for symbol in self._symbols:
+        try:
+            htf_frames = self.fetch_htf()
+        except Exception:
+            logger.exception("HTF fetch failed; skipping this pass.")
+            return triggers
+
+        if self._stop_event.is_set():
+            return triggers
+
+        # Phase 2 — advance every live zone against the new candles first, so a
+        # zone that died is never re-confirmed by later logic in the same pass.
+        for symbol, frame in htf_frames.items():
+            for event in self._watchlist.update_from_htf(symbol, frame):
+                level = logger.info if event.kind == "invalidated" else logger.info
+                level("%s: zone %s — %s", symbol, event.kind, event.detail)
+                funnel[f"zone_{event.kind}"] += 1
+
+        # Phase 3 — admit new structures.
+        for symbol, frame in htf_frames.items():
             if self._stop_event.is_set():
                 break
             try:
-                result = self.scan_symbol(symbol)
-            except Exception:  # a bad symbol must never kill the pass
+                result = self.scan_symbol(symbol, frame)
+            except Exception:
                 logger.exception("Unexpected error while scanning %s.", symbol)
                 funnel["error"] += 1
                 continue
 
-            if result is None:
-                funnel["error"] += 1
-            else:
-                funnel[result.stage.value] += 1
-                signal = self._accept(symbol, result)
-                if signal is not None:
-                    found.append(signal)
-                    self._dispatch(signal)
+            funnel[result.stage.value] += 1
+            if not result.matched:
+                logger.debug("%s: %s", symbol, result.reason)
+                continue
 
-            # Gentle spacing on top of CCXT's own rate limiter.
-            if self._settings.request_delay_seconds > 0 and self._stop_event.wait(
-                self._settings.request_delay_seconds
-            ):
-                break
+            signal_result = result.signal
+            assert signal_result is not None
+            if self._admit(signal_result, frame):
+                logger.info("%s: %s", symbol, result.reason)
+                funnel["zone_added"] += 1
+
+        # Phase 4 — confirm tagged zones on the lower timeframe.
+        tagged = [z for z in self._watchlist.active() if z.state is WatchState.TAGGED]
+        if tagged and not self._stop_event.is_set():
+            symbols = sorted({z.symbol for z in tagged})
+            ltf_frames = self.fetch_ltf(symbols)
+            for zone in tagged:
+                frame = ltf_frames.get(zone.symbol)
+                if frame is None:
+                    continue
+                trigger = self._try_confirm(zone, frame)
+                if trigger is not None:
+                    triggers.append(trigger)
+                    funnel["confirmed"] += 1
+                else:
+                    funnel["awaiting_ltf"] += 1
 
         self._log_funnel(funnel)
-        return found
+        self.save_watchlist()
+        return triggers
 
-    def _accept(self, symbol: str, result: StrategyResult) -> TradeSignal | None:
-        """Return the signal to dispatch, or ``None`` if rejected or already sent."""
-        if not result.matched:
-            logger.debug("%s: %s", symbol, result.reason)
+    def _admit(self, signal_result: TradeSignal, frame: pd.DataFrame) -> bool:
+        """Add a validated setup to the watchlist. False if already tracked."""
+        zone = WatchedZone.from_order_block(
+            signal_result.symbol,
+            signal_result.timeframe,
+            signal_result.block,
+            entry=signal_result.plan.entry,
+            stop_loss=signal_result.plan.stop_loss,
+            take_profit=signal_result.plan.take_profit,
+            quantity=signal_result.plan.quantity,
+            created_ms=int(frame["timestamp"].iloc[-1]),
+        )
+        return self._watchlist.add(zone)
+
+    def _try_confirm(self, zone: WatchedZone, ltf: pd.DataFrame) -> LtfTrigger | None:
+        """Look for an LTF trigger on a tagged zone and dispatch if found."""
+        trigger, rejection = confirm_entry(
+            ltf,
+            zone,
+            timeframe=self._settings.ltf_timeframe,
+            strength=self._settings.swing_strength,
+            window=self._settings.confirm_window,
+            min_fvg_pct=self._settings.ltf_min_fvg_pct,
+        )
+        if trigger is None:
+            if rejection is not None:
+                logger.debug("%s: %s", zone.symbol, rejection.reason)
             return None
 
-        signal = result.signal
-        assert signal is not None  # guaranteed by result.matched
-
-        # Keyed on the order block candle, not the confirmation candle: the same
-        # block stays the newest structure for as long as price has not returned
-        # to it, and it must only be alerted once.
-        block_timestamp = signal.block.candle.timestamp
-        if self._last_alerted.get(symbol) == block_timestamp:
-            logger.debug("%s: order block already reported.", symbol)
-            return None
-
-        self._last_alerted[symbol] = block_timestamp
-        return signal
+        self._watchlist.mark_triggered(zone, when_ms=trigger.fvg_timestamp)
+        self._dispatch(zone, trigger)
+        return trigger
 
     def _log_funnel(self, funnel: Counter[str]) -> None:
-        """Report where symbols dropped out, so filter tuning is observable.
+        """Report where candidates dropped out, so filtering is observable.
 
-        Stages are counted from the typed :class:`FilterStage`, not by matching
-        the reason text — the trend and volume messages both read "is not
-        above", so substring matching would silently conflate them.
+        Stages are counted from the typed :class:`FilterStage`, never by matching
+        the reason text — several rejection messages share wording, and substring
+        matching would silently conflate them.
         """
         if not funnel:
             return
-        # Derived from the enum's declaration order, so a new stage appears here
-        # automatically instead of being silently dropped from the report.
-        ordered = [stage.value for stage in FilterStage] + ["error"]
+        ordered = [stage.value for stage in FilterStage] + [
+            "zone_added",
+            "zone_tagged",
+            "zone_invalidated",
+            "awaiting_ltf",
+            "confirmed",
+            "error",
+        ]
         logger.info(
             "Filter funnel: %s",
-            ", ".join(f"{stage}={funnel[stage]}" for stage in ordered if funnel[stage])
+            ", ".join(f"{name}={funnel[name]}" for name in ordered if funnel[name])
             or "nothing evaluated",
         )
+        counts = self._watchlist.counts()
+        logger.info(
+            "Watchlist: %d pending, %d tagged, %d triggered, %d invalidated",
+            counts.get(WatchState.PENDING.value, 0),
+            counts.get(WatchState.TAGGED.value, 0),
+            counts.get(WatchState.TRIGGERED.value, 0),
+            counts.get(WatchState.INVALIDATED.value, 0),
+        )
 
-    def build_order(self, signal: TradeSignal) -> ExecutionOrder | None:
-        """Render a signal as a routable Binance order, or ``None`` if it cannot be.
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+    def build_order(self, zone: WatchedZone) -> ExecutionOrder | None:
+        """Render a confirmed zone as a routable Binance order.
 
         Failing to format an order must not suppress the alert — a human can act
         on the levels either way — so the error is logged and the alert still
         goes out without the routing block.
         """
         try:
-            return build_execution_order(
-                signal.symbol,
-                signal.plan,
-                signal.block,
+            return build_execution_order_from_zone(
+                zone,
                 price_to_precision=self._market_data.price_to_precision,
                 amount_to_precision=self._market_data.amount_to_precision,
             )
         except (ValueError, TypeError) as exc:
-            logger.error("Could not build an execution order for %s: %s", signal.symbol, exc)
+            logger.error("Could not build an execution order for %s: %s", zone.symbol, exc)
             return None
 
-    def _dispatch(self, result: TradeSignal) -> None:
-        plan = result.plan
-        order = self.build_order(result)
-
+    def _dispatch(self, zone: WatchedZone, trigger: LtfTrigger) -> None:
+        order = self.build_order(zone)
         logger.info(
-            "%s %s order block on %s %s | entry %s | SL %s (risk %.2f%%) | "
-            "TP 1:%g %s | qty %s | FVG %.2f%%",
-            result.direction.emoji,
-            result.direction.value,
-            result.symbol,
-            result.timeframe,
-            order.entry if order else f"{plan.entry:g}",
-            order.stop_loss if order else f"{plan.stop_loss:g}",
-            plan.risk_pct_of_entry,
-            plan.reward_ratio,
-            order.take_profit if order else f"{plan.take_profit:g}",
-            order.quantity if order else f"{plan.quantity:g}",
-            result.block.fvg.size_pct(plan.entry),
+            "%s %s ENTRY on %s | zone [%g, %g] | entry %s | SL %s | TP %s | "
+            "LTF %s CHoCH + %.2f%% FVG",
+            zone.direction.emoji,
+            zone.direction.value,
+            zone.symbol,
+            zone.zone_low,
+            zone.zone_high,
+            order.entry if order else f"{zone.entry:g}",
+            order.stop_loss if order else f"{zone.stop_loss:g}",
+            order.take_profit if order else f"{zone.take_profit:g}",
+            trigger.timeframe,
+            trigger.fvg_pct,
         )
 
         def to_precision(value: float) -> str | None:
-            return self._market_data.price_to_precision(result.symbol, value)
+            return self._market_data.price_to_precision(zone.symbol, value)
 
-        if not self._notifier.send_signal(result, order=order, to_precision=to_precision):
-            logger.error("Failed to deliver alert for %s.", result.symbol)
-            # Clear the dedup marker so a pass that still sees this structure as
-            # the newest one (an error-backoff retry, or a restart before the next
-            # close) can re-send it. Once the candle rolls over the signal is
-            # intentionally abandoned rather than delivered late.
-            self._last_alerted.pop(result.symbol, None)
+        if not self._notifier.send_signal(
+            zone, trigger=trigger, order=order, to_precision=to_precision
+        ):
+            logger.error("Failed to deliver alert for %s.", zone.symbol)
+
+    # ------------------------------------------------------------------
+    # Historical simulation
+    # ------------------------------------------------------------------
+    def simulate(self, *, candle_limit: int | None = None) -> SimulationReport:
+        """Replay the pipeline over stored candles and report the funnel."""
+        htf_limit = candle_limit or self._settings.candle_limit
+
+        # Both timeframes must cover the SAME wall-clock span. A 15m frame needs
+        # four times as many candles as a 1h one to do that, which is past every
+        # venue's per-request cap — so the history fetch pages. Getting this
+        # wrong makes every older zone look unconfirmable for want of data.
+        htf_seconds = self._market_data.timeframe_seconds(self._settings.timeframe)
+        ltf_seconds = self._market_data.timeframe_seconds(self._settings.ltf_timeframe)
+        ltf_bars = int(htf_limit * htf_seconds / ltf_seconds) + self._settings.confirm_window
+
+        logger.info(
+            "Fetching %d %s and %d %s candles for %d symbols (%.1f days)...",
+            htf_limit,
+            self._settings.timeframe,
+            ltf_bars,
+            self._settings.ltf_timeframe,
+            len(self._symbols),
+            htf_limit * htf_seconds / 86_400,
+        )
+
+        htf: dict[str, pd.DataFrame] = {}
+        ltf: dict[str, pd.DataFrame] = {}
+        for symbol in self._symbols:
+            if self._stop_event.is_set():
+                break
+            try:
+                htf_frame = self._market_data.fetch_ohlcv_history(
+                    symbol, self._settings.timeframe, bars=htf_limit
+                )
+                ltf_frame = self._market_data.fetch_ohlcv_history(
+                    symbol, self._settings.ltf_timeframe, bars=ltf_bars
+                )
+            except MarketDataError as exc:
+                logger.error("Skipping %s: %s", symbol, exc)
+                continue
+            if not htf_frame.empty:
+                htf[symbol] = htf_frame
+            if not ltf_frame.empty:
+                ltf[symbol] = ltf_frame
+
+        for symbol, frame in htf.items():
+            partner = ltf.get(symbol)
+            if partner is None or partner.empty:
+                logger.warning("%s has no LTF data; entries cannot be confirmed.", symbol)
+                continue
+            htf_start = int(frame["timestamp"].iloc[0])
+            ltf_start = int(partner["timestamp"].iloc[0])
+            if ltf_start > htf_start:
+                logger.warning(
+                    "%s LTF history starts %.1f days after the HTF window; zones "
+                    "before that cannot be confirmed and will understate entries.",
+                    symbol,
+                    (ltf_start - htf_start) / 86_400_000,
+                )
+
+        logger.info("Replaying %d HTF frames...", len(htf))
+        return simulate(
+            htf,
+            ltf,
+            self._strategy,
+            timeframe=self._settings.timeframe,
+            ltf_timeframe=self._settings.ltf_timeframe,
+            swing_strength=self._settings.swing_strength,
+            confirm_window=self._settings.confirm_window,
+            ltf_min_fvg_pct=self._settings.ltf_min_fvg_pct,
+            max_zone_age_ms=self._max_zone_age_ms,
+        )
 
     # ------------------------------------------------------------------
     # Scheduling
@@ -301,7 +468,6 @@ class ScannerBot:
         if self._latest_close_epoch is not None:
             next_close = self._latest_close_epoch
             if next_close <= now:
-                # Advance in whole timeframes to the first close still ahead of us.
                 periods = math.floor((now - next_close) / tf) + 1
                 next_close += periods * tf
         else:
@@ -313,25 +479,30 @@ class ScannerBot:
         """Scan on every candle close until interrupted. Never raises on scan errors."""
         logger.info("Scanner started — %s", self._settings.describe())
         logger.info(
-            "Candle duration %ds; structures are read from the most recently CLOSED "
-            "candles. LONG needs a bearish block at [-3] before a bullish impulse at "
-            "[-2], validated by low[-1] > high[-3]; SHORT is the mirror image.",
-            self._timeframe_seconds,
+            "Structure is read on %s: a block at [-3] before an impulse at [-2], "
+            "validated by a fair value gap of at least %g%% and only taken from the "
+            "%s half of the %d-bar dealing range.",
+            self._settings.timeframe,
+            self._settings.min_fvg_pct,
+            "discount (long) / premium (short)",
+            self._settings.range_lookback,
         )
         logger.info(
-            "Entry rests at the block's proximal edge; stop sits %g%% beyond the "
-            "distal edge; target at 1:%g. Size risks %g%% of %.2f equity.",
-            self._settings.stop_buffer_pct,
+            "Entries are NOT blind: a validated zone is watched until price returns "
+            "to it and %s prints a change of character with its own fair value gap. "
+            "Zones die if the 1:%g target is reached first, if an %s candle closes "
+            "beyond the distal edge, or after %g hours.",
+            self._settings.ltf_timeframe,
             self._settings.reward_ratio,
-            self._settings.risk_per_trade_pct,
-            self._settings.account_equity,
+            self._settings.timeframe,
+            self._settings.max_zone_age_hours,
         )
 
         while not self._stop_event.is_set():
             started = time.monotonic()
             try:
-                signals = self.scan_once()
-            except Exception:  # last line of defence — the loop must survive
+                triggers = self.scan_once()
+            except Exception:
                 logger.exception("Scan pass failed; continuing after backoff.")
                 if self._stop_event.wait(self._settings.retry_backoff_seconds):
                     break
@@ -339,10 +510,11 @@ class ScannerBot:
 
             elapsed = time.monotonic() - started
             logger.info(
-                "Pass complete: %d symbol(s) in %.1fs, %d signal(s).",
+                "Pass complete: %d symbol(s) in %.1fs, %d confirmed entr%s.",
                 len(self._symbols),
                 elapsed,
-                len(signals),
+                len(triggers),
+                "y" if len(triggers) == 1 else "ies",
             )
 
             if self._stop_event.is_set():
@@ -354,3 +526,49 @@ class ScannerBot:
                 break
 
         logger.info("Scanner stopped.")
+
+
+def build_execution_order_from_zone(
+    zone: WatchedZone,
+    *,
+    price_to_precision=None,
+    amount_to_precision=None,
+) -> ExecutionOrder:
+    """Adapt a watched zone to the execution-order builder.
+
+    The zone carries the levels that were computed when it was admitted, so an
+    entry uses the price structure that was validated rather than one recomputed
+    from whatever the market looks like at confirmation time.
+    """
+    from scanner.execution import ExecutionOrder as _Order
+    from scanner.execution import to_binance_symbol
+
+    def price(value: float) -> str:
+        if price_to_precision is not None:
+            rendered = price_to_precision(zone.symbol, value)
+            if rendered is not None:
+                return rendered
+        return f"{value:.8f}".rstrip("0").rstrip(".") or "0"
+
+    def amount(value: float) -> str:
+        if amount_to_precision is not None:
+            rendered = amount_to_precision(zone.symbol, value)
+            if rendered is not None:
+                return rendered
+        return f"{value:.8f}".rstrip("0").rstrip(".") or "0"
+
+    risk_per_unit = abs(zone.entry - zone.stop_loss)
+    reward_ratio = (
+        abs(zone.take_profit - zone.entry) / risk_per_unit if risk_per_unit > 0 else 0.0
+    )
+    return _Order(
+        symbol=to_binance_symbol(zone.symbol),
+        side=zone.direction.binance_side,
+        quantity=amount(zone.quantity),
+        entry=price(zone.entry),
+        stop_loss=price(zone.stop_loss),
+        take_profit=price(zone.take_profit),
+        reward_ratio=round(reward_ratio, 4),
+        risk_pct=0.0,
+        risk_amount=zone.quantity * risk_per_unit,
+    )

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Callable, Final, TypeVar
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Final, Sequence, TypeVar
 
 import ccxt
 import pandas as pd
@@ -18,6 +19,9 @@ import pandas as pd
 from scanner.candles import REQUIRED_COLUMNS
 
 logger: Final[logging.Logger] = logging.getLogger(__name__)
+
+#: Most venues cap a single OHLCV response here; paging works around it.
+MAX_OHLCV_PER_REQUEST: Final[int] = 1000
 
 T = TypeVar("T")
 
@@ -247,6 +251,135 @@ class MarketDataClient:
             return str(self._exchange.price_to_precision(symbol, price))
         except Exception:  # unknown symbol or missing precision metadata
             return None
+
+    def fetch_ohlcv_history(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        bars: int,
+        max_pages: int = 20,
+    ) -> pd.DataFrame:
+        """Fetch up to ``bars`` candles, paging past the per-request cap.
+
+        Venues cap one OHLCV response (1000 on Binance, ~720 on Kraken), which
+        is fine for live scanning but not for a backtest: a multi-timeframe
+        replay needs the *same wall-clock span* on both timeframes, and the
+        lower one needs several times more candles to cover it. Without paging
+        the LTF frame silently covers a fraction of the HTF period and every
+        older zone looks unconfirmable.
+
+        Pages forward from ``now - bars * timeframe`` using ``since``.
+        """
+        duration_ms = self.timeframe_seconds(timeframe) * 1000
+        now_ms = int(self._exchange.milliseconds())
+        cursor = now_ms - bars * duration_ms
+        per_request = min(MAX_OHLCV_PER_REQUEST, max(bars, 2))
+
+        rows: list[list[float]] = []
+        for _ in range(max_pages):
+            if self._stop_event.is_set():
+                break
+            page: list[list[float]] = self._with_retries(
+                f"fetch_ohlcv({symbol}, {timeframe}, since={cursor})",
+                lambda c=cursor: self._exchange.fetch_ohlcv(
+                    symbol, timeframe=timeframe, since=int(c), limit=per_request
+                ),
+            )
+            if not page:
+                break
+            rows.extend(page)
+            newest = int(page[-1][0])
+            # Stop when the venue stops advancing, or we have reached the present.
+            if newest <= cursor or newest >= now_ms - duration_ms:
+                break
+            cursor = newest + duration_ms
+            if len(rows) >= bars + per_request:
+                break
+
+        if not rows:
+            return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
+
+        df = pd.DataFrame(rows, columns=list(REQUIRED_COLUMNS))
+        df = df.astype(
+            {
+                "timestamp": "int64",
+                "open": "float64",
+                "high": "float64",
+                "low": "float64",
+                "close": "float64",
+                "volume": "float64",
+            }
+        )
+        df = df.drop_duplicates(subset="timestamp", keep="last")
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        df = self._drop_unclosed_candle(df, timeframe)
+        df = df.tail(bars).reset_index(drop=True)
+        df["open_time"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        return df
+
+    def fetch_many(
+        self,
+        jobs: "Sequence[tuple[str, str, int]]",
+        *,
+        max_workers: int = 4,
+    ) -> "dict[tuple[str, str], pd.DataFrame]":
+        """Fetch several ``(symbol, timeframe, limit)`` frames concurrently.
+
+        Multi-timeframe scanning multiplies request count by the number of
+        timeframes, and each request is almost entirely network wait. Threads
+        overlap that wait; nothing here is CPU-bound.
+
+        **Each worker gets its own exchange instance.** CCXT's synchronous
+        client keeps a ``requests.Session`` and a rate-limit clock on the
+        instance, neither of which is safe to share across threads. The
+        trade-off is that the venue sees up to ``max_workers`` times the request
+        rate, so ``REQUEST_DELAY_SECONDS`` still matters as a backstop.
+
+        Failures are logged and omitted from the result rather than raised — one
+        unavailable symbol must not sink the whole pass.
+        """
+        if not jobs:
+            return {}
+
+        results: dict[tuple[str, str], pd.DataFrame] = {}
+        workers = max(1, min(max_workers, len(jobs)))
+        local = threading.local()
+
+        def client_for_thread() -> "MarketDataClient":
+            existing = getattr(local, "client", None)
+            if existing is not None:
+                return existing
+            if workers == 1:
+                local.client = self
+            else:
+                clone = MarketDataClient(
+                    self._exchange_id,
+                    timeout_seconds=self._exchange.timeout / 1000,
+                    max_retries=self._max_retries,
+                    retry_backoff_seconds=self._retry_backoff_seconds,
+                    stop_event=self._stop_event,
+                )
+                clone._exchange.markets = self._exchange.markets
+                clone._exchange.markets_by_id = self._exchange.markets_by_id
+                clone._markets_loaded = self._markets_loaded
+                local.client = clone
+            return local.client
+
+        def run(job: tuple[str, str, int]) -> tuple[tuple[str, str], pd.DataFrame | None]:
+            symbol, timeframe, limit = job
+            try:
+                frame = client_for_thread().fetch_ohlcv(symbol, timeframe, limit)
+            except MarketDataError as exc:
+                logger.error("Skipping %s %s: %s", symbol, timeframe, exc)
+                return (symbol, timeframe), None
+            return (symbol, timeframe), frame
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ohlcv") as pool:
+            for key, frame in pool.map(run, jobs):
+                if frame is not None:
+                    results[key] = frame
+        return results
 
     def amount_to_precision(self, symbol: str, amount: float) -> str | None:
         """Format ``amount`` using the venue's lot size, or ``None`` if unknown.

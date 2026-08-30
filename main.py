@@ -1,7 +1,8 @@
-"""Crypto Scanner Bot v3.0 (Smart Money Concepts) — entrypoint.
+"""Crypto Scanner Bot v3.1 (Institutional MTF SMC) — entrypoint.
 
-Monitors a configurable set of pairs for order blocks validated by fair value
-gaps, and emits a fully sized pending limit order for each one.
+Watches a configurable set of pairs for extreme order blocks with real
+displacement, then confirms entries on a lower timeframe before building an
+order. Use --simulate to replay the pipeline over history and report the funnel.
 
 Usage::
 
@@ -37,6 +38,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description=(
             "Scan for Smart Money order blocks validated by fair value gaps, "
             "sized to a fixed fraction of account equity."
+        ),
+    )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help=(
+            "Replay the pipeline over historical candles, print the funnel and "
+            "signal-frequency report, then exit. Implies --dry-run."
+        ),
+    )
+    parser.add_argument(
+        "--history",
+        type=int,
+        default=None,
+        help="Candles per symbol for --simulate (default: CANDLE_LIMIT).",
+    )
+    parser.add_argument(
+        "--entries",
+        choices=["table", "full", "csv", "none"],
+        default="full",
+        help=(
+            "How to list the confirmed entries from --simulate: 'full' adds a "
+            "per-entry breakdown, 'csv' prints machine-readable rows."
         ),
     )
     parser.add_argument(
@@ -97,7 +121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         settings = apply_overrides(
-            Settings.from_env(force_dry_run=args.dry_run), args
+            Settings.from_env(force_dry_run=args.dry_run or args.simulate), args
         )
     except ConfigError as exc:
         # Logging is not configured yet, so write directly to stderr.
@@ -112,7 +136,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         bot.install_signal_handlers()
         bot.startup_checks()
 
-        if args.once:
+        if args.simulate:
+            report = bot.simulate(candle_limit=args.history)
+            print(report.render())
+            if args.entries == "csv":
+                print()
+                print(report.entries_csv())
+            elif args.entries != "none":
+                print()
+                print(report.render_entries(detailed=args.entries == "full"))
+            logger.info("Filter funnel: %s", report.funnel_line())
+        elif args.once:
             signals = bot.scan_once()
             logger.info("Single pass complete: %d signal(s).", len(signals))
         else:

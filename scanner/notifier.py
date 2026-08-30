@@ -16,7 +16,8 @@ from typing import Any, Callable, Final, Protocol, Sequence
 import requests
 
 from scanner.execution import ExecutionOrder
-from scanner.strategy import TradeSignal
+from scanner.mtf import LtfTrigger
+from scanner.watchlist import WatchedZone
 
 logger: Final[logging.Logger] = logging.getLogger(__name__)
 
@@ -111,59 +112,77 @@ def format_price_group(
 
 
 def build_message(
-    signal: TradeSignal,
+    zone: WatchedZone,
     *,
+    trigger: LtfTrigger | None = None,
     order: ExecutionOrder | None = None,
     to_precision: Callable[[float], str | None] | None = None,
 ) -> str:
-    """Compose the HTML alert for a validated order block.
+    """Compose the HTML alert for a lower-timeframe confirmed entry.
 
-    Every price is formatted as one group so entry, stop and target carry the
-    same decimals — they are read against each other.
+    Every price is formatted as one group so the zone, entry, stop and target
+    carry the same decimals — they are read against each other.
     """
-    plan = signal.plan
-    block = signal.block
-    values = (*plan.prices(), block.proximal, block.distal)
+    values = (
+        zone.entry,
+        zone.stop_loss,
+        zone.take_profit,
+        zone.zone_low,
+        zone.zone_high,
+    )
     texts = [to_precision(v) for v in values] if to_precision else None
-    entry, stop, target, proximal, distal = format_price_group(values, texts)
-    unit = quote_prefix(signal.symbol)
-    direction = signal.direction
+    entry, stop, target, zone_low, zone_high = format_price_group(values, texts)
+    unit = quote_prefix(zone.symbol)
+    direction = zone.direction
 
-    zone_low, zone_high = (distal, proximal) if direction.is_long else (proximal, distal)
-    gap_pct = block.fvg.size_pct(plan.entry)
-    confirmed = signal.confirmed_at.strftime("%Y-%m-%d %H:%M UTC")
+    risk_per_unit = abs(zone.entry - zone.stop_loss)
+    risk_pct = risk_per_unit / zone.entry * 100.0 if zone.entry > 0 else 0.0
+    reward_ratio = abs(zone.take_profit - zone.entry) / risk_per_unit if risk_per_unit else 0.0
+    move_pct = (
+        (zone.take_profit - zone.entry) / zone.entry * 100.0 if zone.entry > 0 else 0.0
+    )
+    risk_amount = zone.quantity * risk_per_unit
+    notional = zone.quantity * zone.entry
+    half = "discount" if direction.is_long else "premium"
 
     lines = [
-        f"{direction.emoji} <b>{html.escape(direction.value)} · ORDER BLOCK</b>"
-        f" · {html.escape(signal.symbol)}",
+        f"{direction.emoji} <b>{html.escape(direction.value)} ENTRY · CONFIRMED</b>"
+        f" · {html.escape(zone.symbol)}",
         "",
-        f"<b>Pair:</b> <code>{html.escape(signal.symbol)}</code>",
-        f"<b>Timeframe:</b> {html.escape(signal.timeframe)}",
-        f"<b>Setup:</b> {html.escape(direction.value)} order block, FVG validated",
+        f"<b>Pair:</b> <code>{html.escape(zone.symbol)}</code>",
+        f"<b>Structure:</b> {html.escape(zone.timeframe)} order block",
         "",
         f"<b>OB zone:</b> <code>{unit}{html.escape(zone_low)}</code>"
         f" – <code>{unit}{html.escape(zone_high)}</code>",
-        f"<b>Fair Value Gap:</b> {gap_pct:.2f}% of entry"
-        f"  <i>(displacement confirmed)</i>",
+        f"<b>Displacement:</b> {zone.fvg_pct:.2f}% fair value gap",
+        f"<b>Location:</b> fib {zone.fib_level:.2f} — {html.escape(half)} half",
+    ]
+
+    if trigger is not None:
+        lines += [
+            "",
+            f"✅ <b>{html.escape(trigger.timeframe)} Confirmation</b>",
+            f"• <b>CHoCH:</b> "
+            f"{html.escape(trigger.choch_at.strftime('%Y-%m-%d %H:%M UTC'))}",
+            f"• <b>LTF FVG:</b> {trigger.fvg_pct:.2f}% at "
+            f"{html.escape(trigger.confirmed_at.strftime('%H:%M UTC'))}",
+        ]
+
+    lines += [
         "",
-        "📋 <b>Pending Limit Order</b>",
+        "📋 <b>Order</b>",
         f"• <b>Entry:</b> <code>{unit}{html.escape(entry)}</code>"
-        f"  <i>(limit, at proximal edge)</i>",
+        f"  <i>(proximal edge)</i>",
         f"• <b>Stop-Loss:</b> <code>{unit}{html.escape(stop)}</code>"
-        f"  <i>(distal ∓{plan.buffer_pct:g}%, risk {plan.risk_pct_of_entry:.2f}%)</i>",
-        f"• <b>Take-Profit</b> (1:{plan.reward_ratio:g}): "
+        f"  <i>(beyond distal, risk {risk_pct:.2f}%)</i>",
+        f"• <b>Take-Profit</b> (1:{reward_ratio:.0f}): "
         f"<code>{unit}{html.escape(target)}</code>"
-        f"  <i>({plan.take_profit_move_pct:+.2f}%)</i>",
+        f"  <i>({move_pct:+.2f}%)</i>",
         "",
         "🛡 <b>Position Sizing</b>",
-        f"• <b>Quantity:</b> <code>{html.escape(format_quantity(plan.quantity))}</code>",
-        f"• <b>Risk:</b> {plan.risk_pct:g}% of {unit}"
-        f"{html.escape(format_money(plan.equity))}"
-        f" = <code>{unit}{html.escape(format_money(plan.risk_amount))}</code>",
-        f"• <b>Reward at target:</b> <code>{unit}"
-        f"{html.escape(format_money(plan.reward_amount))}</code>",
-        f"• <b>Notional:</b> {unit}{html.escape(format_money(plan.notional))}"
-        f"  <i>({plan.leverage_required:.2f}x equity)</i>",
+        f"• <b>Quantity:</b> <code>{html.escape(format_quantity(zone.quantity))}</code>",
+        f"• <b>Risk:</b> <code>{unit}{html.escape(format_money(risk_amount))}</code>",
+        f"• <b>Notional:</b> {unit}{html.escape(format_money(notional))}",
     ]
 
     if order is not None:
@@ -176,8 +195,8 @@ def build_message(
 
     lines += [
         "",
-        f"<i>Block opened {html.escape(block.open_time.strftime('%Y-%m-%d %H:%M UTC'))}"
-        f" · confirmed {html.escape(confirmed)}</i>",
+        f"<i>Zone formed "
+        f"{html.escape(zone.created_at.strftime('%Y-%m-%d %H:%M UTC'))}</i>",
     ]
 
     return "\n".join(lines)[:_MAX_MESSAGE_LENGTH]
@@ -188,8 +207,9 @@ class Notifier(Protocol):
 
     def send_signal(
         self,
-        signal: TradeSignal,
+        zone: WatchedZone,
         *,
+        trigger: LtfTrigger | None = ...,
         order: ExecutionOrder | None = ...,
         to_precision: Callable[[float], str | None] | None = ...,
     ) -> bool: ...
@@ -226,13 +246,14 @@ class TelegramNotifier:
 
     def send_signal(
         self,
-        signal: TradeSignal,
+        zone: WatchedZone,
         *,
+        trigger: LtfTrigger | None = None,
         order: ExecutionOrder | None = None,
         to_precision: Callable[[float], str | None] | None = None,
     ) -> bool:
         return self.send_text(
-            build_message(signal, order=order, to_precision=to_precision)
+            build_message(zone, trigger=trigger, order=order, to_precision=to_precision)
         )
 
     def send_text(self, text: str) -> bool:
@@ -337,30 +358,36 @@ class ConsoleNotifier:
 
     def send_signal(
         self,
-        signal: TradeSignal,
+        zone: WatchedZone,
         *,
+        trigger: LtfTrigger | None = None,
         order: ExecutionOrder | None = None,
         to_precision: Callable[[float], str | None] | None = None,
     ) -> bool:
-        plan = signal.plan
+        values = (zone.entry, zone.stop_loss, zone.take_profit)
         entry, stop, target = format_price_group(
-            plan.prices(),
-            [to_precision(v) for v in plan.prices()] if to_precision else None,
+            values, [to_precision(v) for v in values] if to_precision else None
         )
+        risk_per_unit = abs(zone.entry - zone.stop_loss)
+        risk_pct = risk_per_unit / zone.entry * 100.0 if zone.entry > 0 else 0.0
         logger.info(
-            "[DRY RUN] %s %s %s OB | entry %s | SL %s (risk %.2f%%) | TP 1:%g %s "
-            "| qty %s | risk %.2f%% of equity | FVG %.2f%%",
-            signal.direction.emoji,
-            signal.symbol,
-            signal.direction.value,
+            "[DRY RUN] %s %s %s ENTRY | zone [%g, %g] fib %.2f | HTF FVG %.2f%% | "
+            "%s | entry %s | SL %s (risk %.2f%%) | TP %s | qty %s",
+            zone.direction.emoji,
+            zone.symbol,
+            zone.direction.value,
+            zone.zone_low,
+            zone.zone_high,
+            zone.fib_level,
+            zone.fvg_pct,
+            f"{trigger.timeframe} CHoCH + {trigger.fvg_pct:.2f}% FVG"
+            if trigger is not None
+            else "no LTF trigger",
             entry,
             stop,
-            plan.risk_pct_of_entry,
-            plan.reward_ratio,
+            risk_pct,
             target,
-            format_quantity(plan.quantity),
-            plan.risk_pct,
-            signal.block.fvg.size_pct(plan.entry),
+            format_quantity(zone.quantity),
         )
         if order is not None:
             logger.info("[DRY RUN] route: %s", order.to_json())

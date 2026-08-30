@@ -36,6 +36,14 @@ DEFAULT_REWARD_RATIO: Final[float] = 4.0
 #: Share of account equity risked per trade, in **percent**.
 DEFAULT_RISK_PER_TRADE_PCT: Final[float] = 1.0
 
+#: Widest stop, as a percentage of entry, that still counts as a tradable
+#: structure. Fixed-fraction sizing keeps the *loss* constant however wide the
+#: stop is, so an unusually thick order block does not blow up account risk —
+#: it just sizes down to a position too small to be worth the fees, on a zone
+#: too loose to have located anything. Rejecting is more honest than sizing it.
+#: Set to 0.0 to disable the check.
+DEFAULT_MAX_STOP_PCT: Final[float] = 3.5
+
 #: Fallback account equity, in quote currency, when none is configured.
 DEFAULT_ACCOUNT_EQUITY: Final[float] = 10_000.0
 
