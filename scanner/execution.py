@@ -6,7 +6,9 @@ sends them. Routing, signing and keys belong to the execution engine.
 
 Two orders describe one setup:
 
-* the **entry**, a resting ``LIMIT`` order at the block's proximal edge;
+* the **entry** — for v3 a resting ``LIMIT`` order at the block's proximal
+  edge; for the V4.0 deviation research model a ``MARKET`` order at the close
+  that confirmed the sweep (:func:`build_market_order`);
 * the **protective** pair, a ``STOP_LOSS_LIMIT`` and ``TAKE_PROFIT_LIMIT``
   that must only be submitted *after* the entry fills.
 
@@ -78,6 +80,7 @@ class ExecutionOrder:
     risk_pct: float
     risk_amount: float
     time_in_force: str = "GTC"
+    entry_type: str = "LIMIT"   # LIMIT | MARKET — ``entry`` is only a reference for MARKET
 
     @property
     def exit_side(self) -> str:
@@ -85,7 +88,18 @@ class ExecutionOrder:
         return "SELL" if self.side == "BUY" else "BUY"
 
     def entry_payload(self) -> dict[str, Any]:
-        """``POST /api/v3/order`` parameters for the resting entry."""
+        """``POST /api/v3/order`` parameters for the entry.
+
+        A market entry carries no price or time-in-force: sending either with
+        ``type=MARKET`` is rejected by Binance.
+        """
+        if self.entry_type == "MARKET":
+            return {
+                "symbol": self.symbol,
+                "side": self.side,
+                "type": "MARKET",
+                "quantity": self.quantity,
+            }
         return {
             "symbol": self.symbol,
             "side": self.side,
@@ -130,21 +144,13 @@ class ExecutionOrder:
         return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
 
 
-def build_execution_order(
+def _renderers(
     symbol: str,
-    plan: TradePlan,
-    block: OrderBlock,
-    *,
-    price_to_precision: Callable[[str, float], str | None] | None = None,
-    amount_to_precision: Callable[[str, float], str | None] | None = None,
-) -> ExecutionOrder:
-    """Render ``plan`` as a routable order.
-
-    Prices and quantity are emitted as **strings** at the venue's tick and lot
-    precision. Binance rejects orders that violate ``PRICE_FILTER`` or
-    ``LOT_SIZE``, and float repr is exactly how an over-precise value slips
-    through — ``0.1 + 0.2`` is not ``0.3``.
-    """
+    price_to_precision: Callable[[str, float], str | None] | None,
+    amount_to_precision: Callable[[str, float], str | None] | None,
+) -> tuple[Callable[[float], str], Callable[[float], str]]:
+    """Price and amount formatters at the venue's precision, with a plain
+    fallback when the venue's rules are unavailable."""
 
     def price(value: float) -> str:
         if price_to_precision is not None:
@@ -160,6 +166,25 @@ def build_execution_order(
                 return rendered
         return f"{value:.8f}".rstrip("0").rstrip(".") or "0"
 
+    return price, amount
+
+
+def build_execution_order(
+    symbol: str,
+    plan: TradePlan,
+    block: OrderBlock,
+    *,
+    price_to_precision: Callable[[str, float], str | None] | None = None,
+    amount_to_precision: Callable[[str, float], str | None] | None = None,
+) -> ExecutionOrder:
+    """Render ``plan`` as a routable order.
+
+    Prices and quantity are emitted as **strings** at the venue's tick and lot
+    precision. Binance rejects orders that violate ``PRICE_FILTER`` or
+    ``LOT_SIZE``, and float repr is exactly how an over-precise value slips
+    through — ``0.1 + 0.2`` is not ``0.3``.
+    """
+    price, amount = _renderers(symbol, price_to_precision, amount_to_precision)
     return ExecutionOrder(
         symbol=to_binance_symbol(symbol),
         side=block.direction.binance_side,
@@ -173,10 +198,39 @@ def build_execution_order(
     )
 
 
+def build_market_order(
+    symbol: str,
+    plan: TradePlan,
+    *,
+    price_to_precision: Callable[[str, float], str | None] | None = None,
+    amount_to_precision: Callable[[str, float], str | None] | None = None,
+) -> ExecutionOrder:
+    """Render a plan whose entry is taken at market — the V4.0 deviation model.
+
+    The plan's entry is the confirming close, kept only as a reference: the
+    fill will be wherever the market is when the order lands, and the quantity
+    was sized against that reference, so a fill far from it changes the risk.
+    """
+    price, amount = _renderers(symbol, price_to_precision, amount_to_precision)
+    return ExecutionOrder(
+        symbol=to_binance_symbol(symbol),
+        side=plan.direction.binance_side,
+        quantity=amount(plan.quantity),
+        entry=price(plan.entry),
+        stop_loss=price(plan.stop_loss),
+        take_profit=price(plan.take_profit),
+        reward_ratio=plan.reward_ratio,
+        risk_pct=plan.risk_pct,
+        risk_amount=plan.risk_amount,
+        entry_type="MARKET",
+    )
+
+
 __all__ = [
     "Direction",
     "ExecutionOrder",
     "build_execution_order",
+    "build_market_order",
     "to_binance_symbol",
     "to_unified_symbol",
 ]

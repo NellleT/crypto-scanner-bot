@@ -432,6 +432,26 @@ class ScannerBot:
     # ------------------------------------------------------------------
     # Historical simulation
     # ------------------------------------------------------------------
+    def fetch_history(
+        self, *, bars: int, timeframe: str | None = None
+    ) -> dict[str, pd.DataFrame]:
+        """Paged closed-candle history for every symbol on one timeframe, for
+        research backtests. A symbol the venue will not serve is skipped."""
+        tf = timeframe or self._settings.timeframe
+        logger.info("Fetching %d %s candles for %d symbols...", bars, tf, len(self._symbols))
+        frames: dict[str, pd.DataFrame] = {}
+        for symbol in self._symbols:
+            if self._stop_event.is_set():
+                break
+            try:
+                frame = self._market_data.fetch_ohlcv_history(symbol, tf, bars=bars)
+            except MarketDataError as exc:
+                logger.error("Skipping %s: %s", symbol, exc)
+                continue
+            if not frame.empty:
+                frames[symbol] = frame
+        return frames
+
     def simulate(self, *, candle_limit: int | None = None) -> SimulationReport:
         """Replay the pipeline over stored candles and report the funnel."""
         htf_limit = candle_limit or self._settings.candle_limit

@@ -8,6 +8,7 @@ import pytest
 
 from scanner.execution import (
     build_execution_order,
+    build_market_order,
     to_binance_symbol,
     to_unified_symbol,
 )
@@ -131,3 +132,38 @@ def test_entry_and_exit_quantities_match() -> None:
     """A mismatch would leave a residual position after the bracket fires."""
     order, _ = make_order()
     assert order.entry_payload()["quantity"] == order.oco_payload()["quantity"]
+
+
+# ---------------------------------------------------------------------------
+# Market entries — the V4.0 deviation model
+# ---------------------------------------------------------------------------
+def deviation_plan():
+    from scanner.deviation import plan_deviation, scan_deviations
+    from tests.test_deviation import P, RANGE, WICK_ABOVE, frame
+
+    plan, _ = plan_deviation(scan_deviations(frame(RANGE + [WICK_ABOVE]), P)[0], P)
+    assert plan is not None
+    return plan
+
+
+def test_market_entry_carries_no_price_or_time_in_force() -> None:
+    """Binance rejects a MARKET order that sends either."""
+    order = build_market_order("BTC/USDT", deviation_plan())
+    payload = order.entry_payload()
+    assert payload == {
+        "symbol": "BTCUSDT", "side": "SELL", "type": "MARKET", "quantity": order.quantity,
+    }
+
+
+def test_market_entry_is_protected_by_the_same_oco() -> None:
+    plan = deviation_plan()          # short: stop above, target below
+    oco = build_market_order("BTC/USDT", plan).oco_payload()
+    assert oco["side"] == "BUY"
+    assert float(oco["abovePrice"]) == pytest.approx(plan.stop_loss)
+    assert float(oco["belowPrice"]) == pytest.approx(plan.take_profit)
+
+
+def test_limit_orders_are_unchanged_by_the_market_variant() -> None:
+    order, _plan = make_order()
+    assert order.entry_payload()["type"] == "LIMIT"
+    assert order.entry_type == "LIMIT"

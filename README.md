@@ -5,8 +5,9 @@
 > every variant tested. At 1:3 it won **20.1%** of 239 filled trades against the
 > 25% it needs to break even: **−52R after futures fees, −43% of the account at
 > 1% risk**. Keep `DRY_RUN=true`. The numbers are under
-> [Three-year backtest](#three-year-backtest). Its successor, V4.0, is in
-> research.
+> [Three-year backtest](#three-year-backtest). Its intended successor — V4.0,
+> liquidity-sweep deviations — has been built and backtested, and **found no
+> edge either**; see [V4.0 research](#v40-research--liquidity-sweep-deviations).
 
 Finds higher-timeframe **Order Blocks** with genuine displacement at the
 **extremes** of the dealing range, watches them, and only builds an order once
@@ -219,6 +220,79 @@ are superseded: they came from the replay and outcome model fixed in v3.1.1.
 
 ---
 
+## V4.0 research — liquidity-sweep deviations
+
+**Research only; not wired into the live scanner.** The idea: resting stops sit
+just beyond obvious swing highs and lows, and when price runs them but cannot
+hold beyond, the break was a liquidity grab and price should revert into the
+range. V4 fades that failure.
+
+### The model (`scanner/deviation.py`)
+
+1. **Liquidity pools** — swing highs (BSL) and lows (SSL) confirmed by 3 candles
+   each side, formed within the last 50 candles, never traded through since. The
+   range runs from the lowest untaken SSL to the highest untaken BSL;
+   equilibrium is its midpoint.
+2. **Sweep** — a candle trades beyond a pool. A close back inside is a
+   deviation at once; a close outside is confirmed only by a close back inside
+   within 2 candles, and is otherwise an accepted break. A candle through both
+   ends of the range is not traded.
+3. **Entry** at market on the confirming close (`build_market_order`).
+4. **Stop** 0.1% beyond the most extreme price the sweep reached.
+5. **Target** equilibrium, or the opposite pool.
+
+Causal by construction, and the backtest and the live path run the same
+`scan_deviations` — a test pins that a live-sized window of candles returns
+exactly the verdict full history does.
+
+### What the backtest found
+
+Same three years of Binance candles as above, same seven pairs. The
+configuration, the grid and the headline window were fixed **before** any result
+was seen. `python main.py --backtest-v4` reproduces the one-year view on fresh
+data.
+
+| 1h, lookback 50, target equilibrium | Last 12 months | All three years |
+| --- | --- | --- |
+| Trades | 1,704 | 5,112 |
+| Win rate (fair-bet rate) | 30.0% (30.2%) | 29.1% (29.7%) |
+| Gross | −75.4R | −244.4R |
+| After futures fees | **−293.4R** | −874.4R |
+| Net R per trade, 95% CI | −0.17 (−0.28 to −0.04) | −0.17 (−0.22 to −0.12) |
+
+Net R per trade after futures fees, three years, every confidence interval below
+zero:
+
+| Target | 1h, lookback 20 | 1h, lookback 50 | 15m, lookback 20 | 15m, lookback 50 |
+| --- | --- | --- | --- | --- |
+| Equilibrium | −0.18 | **−0.17** | −0.25 | −0.24 |
+| Opposite pool | −0.16 | −0.25 | −0.23 | −0.22 |
+
+Gross is negative in every cell too (−0.002 to −0.13R per trade), and fees then
+do most of the damage: a stop just beyond a wick is tight — 0.93% median on 1h —
+so a round trip costs about 0.12R on futures and 0.26R on spot.
+
+**Does the direction call carry information?** On the primary configuration,
+gross R per trade:
+
+| Entry | Win rate | R per trade |
+| --- | --- | --- |
+| V4: fade the sweep | 29.1% | −0.048 |
+| Same moment, breakout direction | 29.1% | −0.021 |
+| Random times, same bracket | 30.1% | +0.031 |
+
+Fading is no better than taking the breakout, and worse than entering at random
+(−0.078R per trade, 95% CI −0.129 to −0.027). At these sweeps price was, if
+anything, a little more likely to keep going than to revert. A post-hoc look at
+4h and 1d candles — not part of the fixed test — showed the same: nothing
+positive after fees, and the breakout side at least as good as the fade.
+
+As specified, this signal does not capture a mean-reversion edge on these pairs
+over 2023–2026. Any revision should be written down, with its test and its
+pass mark, before it is run.
+
+---
+
 ## Measured behaviour
 
 The replay behind the backtest above — the same report `--simulate` prints
@@ -299,6 +373,7 @@ pip install -r requirements.txt
 cp .env.example .env            # add Telegram credentials + ACCOUNT_EQUITY
 
 python main.py --simulate                    # replay history, print the funnel
+python main.py --backtest-v4 --history 8760  # V4.0 research backtest, one year
 python main.py --once --dry-run              # one live pass, sends nothing
 python main.py --once --dry-run --log-level DEBUG   # per-symbol rejections
 python main.py                               # run continuously
@@ -359,17 +434,21 @@ Trading Bot/
 │   ├── mtf.py               lower-timeframe confirmation — no I/O
 │   ├── execution.py         Binance order payloads — no I/O
 │   ├── analytics.py         historical replay + funnel report
+│   ├── deviation.py         V4.0 liquidity sweeps: pools, sweeps, plans — no I/O
+│   ├── deviation_backtest.py  V4.0 walk-forward, costs, controls — no I/O
 │   ├── regime.py            ADX + structural regime, kill switch — no I/O
 │   ├── strategy.py          HTF filter chain, typed rejection stages
 │   ├── notifier.py          Telegram delivery + dry-run console notifier
 │   ├── bot.py               MTF scan loop, scheduling, shutdown
 │   └── logging_setup.py     console + rotating file handlers
-└── tests/                   182 tests, no network required
+└── tests/                   210 tests, no network required
     ├── test_smc.py          displacement, premium/discount, CHoCH
     ├── test_watchlist.py    lifecycle + persistence
     ├── test_mtf.py          confirmation stages
     ├── test_regime.py       ADX correctness, causality, both gates
     ├── test_replay.py       replay fidelity to the live scanner's passes
+    ├── test_deviation.py    sweeps, causality, live/backtest parity, plans
+    ├── test_deviation_backtest.py  bracket walk, costs, position rule, controls
     ├── test_risk.py  test_strategy.py  test_execution.py  test_notifier.py
 ```
 

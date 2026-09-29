@@ -6,6 +6,10 @@ extreme of the dealing range (discount for longs, premium for shorts). Even
 then it is only *watched*: an order is built when price returns to the zone and
 the lower timeframe prints a change of character with its own gap. Zones expire
 if the target is reached first, if structure breaks, or with age.
+
+v3.1 is deprecated: a live-faithful three-year backtest found negative
+expectancy in every variant. :mod:`scanner.deviation` holds the V4.0 research
+model (liquidity-sweep deviations), which is evaluated but not wired live.
 """
 
 from __future__ import annotations
@@ -13,9 +17,21 @@ from __future__ import annotations
 from scanner.analytics import SimulationReport, simulate
 from scanner.candles import DEFAULT_MIN_BODY_RATIO, Candle, validate_ohlcv
 from scanner.config import Settings
+from scanner.deviation import (
+    DealingRange,
+    Deviation,
+    DeviationParams,
+    LiquidityPool,
+    PoolSide,
+    TargetMode,
+    latest_deviation,
+    plan_deviation,
+    scan_deviations,
+)
 from scanner.execution import (
     ExecutionOrder,
     build_execution_order,
+    build_market_order,
     to_binance_symbol,
     to_unified_symbol,
 )
@@ -91,14 +107,19 @@ __all__ = [
     "STRUCTURE_LENGTH",
     "Candle",
     "ConfirmationRejection",
+    "DealingRange",
+    "Deviation",
+    "DeviationParams",
     "Direction",
     "ExecutionOrder",
     "FairValueGap",
     "FilterStage",
     "InvalidationReason",
+    "LiquidityPool",
     "LtfTrigger",
     "OrderBlock",
     "OrderBlockStrategy",
+    "PoolSide",
     "RangeZone",
     "Regime",
     "RegimeFilter",
@@ -109,6 +130,7 @@ __all__ = [
     "SimulationReport",
     "StrategyResult",
     "SwingRange",
+    "TargetMode",
     "TradePlan",
     "TradeSignal",
     "WatchState",
@@ -116,16 +138,20 @@ __all__ = [
     "Watchlist",
     "adx_frame",
     "build_execution_order",
+    "build_market_order",
     "build_trade_plan",
     "confirm_entry",
     "detect_choch",
     "detect_order_block",
     "find_choch",
     "find_fvg_after",
+    "latest_deviation",
     "fvg_frame",
     "order_block_mask",
+    "plan_deviation",
     "position_size",
     "premium_discount_frame",
+    "scan_deviations",
     "simulate",
     "structure_frame",
     "swing_points",

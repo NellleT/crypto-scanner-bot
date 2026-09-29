@@ -4,12 +4,16 @@ Watches a configurable set of pairs for extreme order blocks with real
 displacement, then confirms entries on a lower timeframe before building an
 order. Use --simulate to replay the pipeline over history and report the funnel.
 
+v3.1 is deprecated (see README). --backtest-v4 evaluates the V4.0 research
+model — liquidity-sweep deviations — on fetched history; it is not live.
+
 Usage::
 
     python main.py                       # run continuously
     python main.py --once                # single pass, then exit
     python main.py --dry-run             # log alerts instead of sending them
     python main.py --timeframe 1h --symbols BTC/USDT,ETH/USDT
+    python main.py --backtest-v4 --history 8760   # V4.0 research backtest, 1 year
 """
 
 from __future__ import annotations
@@ -49,10 +53,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--backtest-v4",
+        action="store_true",
+        help=(
+            "Backtest the V4.0 liquidity-sweep research model on fetched history "
+            "(both targets, with fees), then exit. Implies --dry-run."
+        ),
+    )
+    parser.add_argument(
         "--history",
         type=int,
         default=None,
-        help="Candles per symbol for --simulate (default: CANDLE_LIMIT).",
+        help=(
+            "Candles per symbol for --simulate (default: CANDLE_LIMIT) or "
+            "--backtest-v4 (default: 8760, a year of 1h)."
+        ),
     )
     parser.add_argument(
         "--entries",
@@ -121,7 +136,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         settings = apply_overrides(
-            Settings.from_env(force_dry_run=args.dry_run or args.simulate), args
+            Settings.from_env(
+                force_dry_run=args.dry_run or args.simulate or args.backtest_v4
+            ),
+            args,
         )
     except ConfigError as exc:
         # Logging is not configured yet, so write directly to stderr.
@@ -136,7 +154,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         bot.install_signal_handlers()
         bot.startup_checks()
 
-        if args.simulate:
+        if args.backtest_v4:
+            from scanner.deviation import DeviationParams, TargetMode
+            from scanner.deviation_backtest import backtest, render
+
+            frames = bot.fetch_history(bars=args.history or 8_760)
+            for target in TargetMode:
+                print(render(backtest(frames, DeviationParams(target=target))))
+        elif args.simulate:
             report = bot.simulate(candle_limit=args.history)
             print(report.render())
             if args.entries == "csv":
