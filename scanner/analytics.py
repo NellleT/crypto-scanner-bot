@@ -11,6 +11,11 @@ advanced bar by bar through its lifecycle, and lower-timeframe confirmation is
 searched only in the candles that closed *after* the zone was tagged. Anything
 cheaper — scanning the whole frame at once and matching zones to outcomes
 afterwards — would quietly use information the live scanner could not have had.
+
+After the tag it replays the live scanner's **passes**, not the LTF bars: the
+scanner wakes once per HTF close, applies HTF invalidation first, and only then
+looks for a trigger. A replay that searched every LTF bar would confirm zones
+the live scanner had already killed, and alert up to an HTF bar early.
 """
 
 from __future__ import annotations
@@ -41,8 +46,11 @@ def _money(value: float) -> str:
         return f"{value:,.4f}"
     return f"{value:.6f}"
 
-#: LTF bars searched forward from a tag before giving up on confirmation.
-DEFAULT_CONFIRM_HORIZON: Final[int] = 40
+#: Cap on scanner passes searched after a tag. ``None`` searches until the zone
+#: dies exactly as it would live — structure break or age — or the data ends.
+#: (It was once a fixed 40 LTF bars, which both cut off confirmations the live
+#: scanner would have taken and ignored the invalidations it would have made.)
+DEFAULT_CONFIRM_HORIZON: Final[int | None] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,10 +83,17 @@ class ConfirmedEntry:
     take_profit: float
     quantity: float
     regime_note: str = ""
+    alert_ms: int = 0    # scanner pass that would have dispatched (a close time)
 
     @staticmethod
     def _at(ms: int) -> datetime:
         return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+    @property
+    def alert_at(self) -> datetime:
+        """When the live scanner would have sent the alert — the pass after the
+        trigger candle closed, not the trigger candle itself."""
+        return self._at(self.alert_ms or self.ltf_fvg_ms)
 
     @property
     def block_at(self) -> datetime:
@@ -151,6 +166,13 @@ class SimulationReport:
     still_open: int = 0
     confirmed: int = 0                # LTF-confirmed entries
     regime_blocked_triggers: int = 0  # LTF triggers suppressed while ranging
+
+    # What happened to tagged zones that never confirmed
+    tagged_structure_break: int = 0   # HTF close beyond distal before a trigger
+    tagged_expired: int = 0           # aged out before a trigger
+    stop_breached: int = 0            # trigger formed with price through the stop
+    target_reached: int = 0           # trigger formed with price past the target
+    tagged_open: int = 0              # still waiting when the data ran out
 
     # LTF rejection breakdown
     ltf_rejections: Counter[str] = field(default_factory=Counter)
@@ -253,6 +275,14 @@ class SimulationReport:
             f"{'CONFIRMED ENTRIES':<40}{self.confirmed:>10}"
             f"{self._pct(self.confirmed, self.watchlist):>14}",
         ]
+        for label, count in (
+            ("  died waiting: HTF structure break", self.tagged_structure_break),
+            ("  died waiting: expired", self.tagged_expired),
+            ("  dead on arrival: through the stop", self.stop_breached),
+            ("  dead on arrival: past the target", self.target_reached),
+            ("  still waiting at end of data", self.tagged_open),
+        ):
+            lines.append(f"{label:<40}{count:>10}{self._pct(count, self.watchlist):>14}")
         if self.regime_blocked_triggers:
             lines.append(
                 f"{'  triggers suppressed (ranging)':<40}{self.regime_blocked_triggers:>10}"
@@ -335,6 +365,8 @@ class SimulationReport:
                 f"     LTF FVG   : {entry.confirmed_at:%Y-%m-%d %H:%M}"
                 f"  ({entry.ltf_fvg_pct:.2f}%,"
                 f" {entry.hours_to_confirm:.1f}h after the tag)",
+                f"     alert     : {entry.alert_at:%Y-%m-%d %H:%M}"
+                "  (the scanner pass that sends it — a close, not an open)",
                 f"     order     : entry {_money(entry.entry)}"
                 f"  stop {_money(entry.stop_loss)}"
                 f"  target {_money(entry.take_profit)}"
@@ -352,7 +384,7 @@ class SimulationReport:
         """The same entries as CSV, for pasting into a spreadsheet."""
         header = (
             "symbol,direction,zone_low,zone_high,fvg_pct,fib_level,zone_half,"
-            "block_utc,tagged_utc,choch_utc,ltf_fvg_utc,ltf_fvg_pct,"
+            "block_utc,tagged_utc,choch_utc,ltf_fvg_utc,alert_utc,ltf_fvg_pct,"
             "entry,stop_loss,take_profit,risk_pct,reward_ratio,quantity"
         )
         rows = [header]
@@ -362,11 +394,51 @@ class SimulationReport:
                 f"{e.fvg_pct:.4f},{e.fib_level:.4f},{e.zone_half},"
                 f"{e.block_at:%Y-%m-%d %H:%M},{e.tagged_at:%Y-%m-%d %H:%M},"
                 f"{e.choch_at:%Y-%m-%d %H:%M},{e.confirmed_at:%Y-%m-%d %H:%M},"
+                f"{e.alert_at:%Y-%m-%d %H:%M},"
                 f"{e.ltf_fvg_pct:.4f},{e.entry:.10g},{e.stop_loss:.10g},"
                 f"{e.take_profit:.10g},{e.risk_pct:.4f},{e.reward_ratio:.2f},"
                 f"{e.quantity:.10g}"
             )
         return "\n".join(rows)
+
+
+@dataclass(frozen=True, slots=True)
+class _Confirmation:
+    """How the live scanner's passes over one tagged zone would have ended."""
+
+    trigger: LtfTrigger | None
+    reason: str                   # confirmed | open | regime | an LTF stage | an invalidation
+    alert_ms: int = 0             # the pass that dispatched or retired the zone
+    invalidation: InvalidationReason | None = None
+    suppressed: int = 0
+    regime_note: str = ""
+
+
+def _tagged_deadline(
+    zone: WatchedZone,
+    future: pd.DataFrame,
+    *,
+    max_zone_age_ms: int | None,
+    htf_bar_ms: int,
+) -> tuple[int | None, InvalidationReason | None]:
+    """When the live scanner would kill a zone that is already tagged.
+
+    Every pass replays the new HTF closes against each live zone: a close beyond
+    the distal edge breaks it, and age retires it. That does not stop at the tag,
+    so neither can the replay. Returns the pass time — the killing candle's close
+    — and the reason, or ``(None, None)`` if the zone outlives the data.
+    """
+    if zone.tagged_ms is None:
+        return None, None
+    for timestamp, close in future[["timestamp", "close"]].to_numpy():
+        ts = int(timestamp)
+        if ts <= zone.tagged_ms:
+            continue  # the tagging candle itself closed inside, or it was no tag
+        if zone.broke_structure(float(close)):
+            return ts + htf_bar_ms, InvalidationReason.STRUCTURE_BREAK
+        if max_zone_age_ms is not None and zone.age_ms(ts) > max_zone_age_ms:
+            return ts + htf_bar_ms, InvalidationReason.EXPIRED
+    return None, None
 
 
 def _confirm_from_tag(
@@ -376,49 +448,71 @@ def _confirm_from_tag(
     tagged_ms: int,
     strategy_timeframe: str,
     confirm_window: int,
-    horizon: int,
     min_fvg_pct: float,
     swing_strength: int,
+    ltf_bar_ms: int,
+    pass_ms: int = 0,
+    deadline_ms: int | None = None,
+    death: InvalidationReason | None = None,
+    horizon: int | None = DEFAULT_CONFIRM_HORIZON,
     regime: RegimeFilter | None = None,
     htf: pd.DataFrame | None = None,
-    ltf_bar_ms: int = 0,
-) -> tuple[LtfTrigger | None, str, int, str]:
-    """Search forward from a tag for an LTF confirmation.
+) -> _Confirmation:
+    """Replay the live scanner's passes over a tagged zone.
 
-    Only candles that closed at or after the tag are visible, so the simulation
-    cannot confirm an entry using a turn that happened before price arrived.
+    The live scanner wakes once per HTF close (``pass_ms`` apart). It learns a
+    zone is tagged when the tagging candle closes, so the first look is at
+    ``tagged_ms + pass_ms``; each look sees only the LTF candles closed by then;
+    and HTF invalidation runs *before* confirmation, so a zone that dies at
+    ``deadline_ms`` cannot confirm at that pass or after it. ``pass_ms`` of zero
+    looks at every LTF close instead, which is what unit tests use.
 
-    Returns the trigger itself rather than a flag, so the caller can record the
-    exact CHoCH and gap timestamps an entry was accepted on — without them a
-    reported entry cannot be checked against a chart.
+    The pass that confirms is returned as ``alert_ms`` — when the order would
+    actually have been sent, up to one HTF bar after the trigger candle closed.
+    The CHoCH must still form at or after the tag, so a turn that predates price
+    arriving cannot confirm it.
 
     With an entry-gated regime filter, a trigger that completes while the HTF
     reads as ranging is suppressed but the zone keeps waiting: a later trigger
     that completes in a trending reading can still fire, which is what the live
     scanner does. The regime is read at the moment the trigger candle CLOSES,
     from HTF candles that had closed by then.
-
-    Returns ``(trigger, reason, suppressed, regime_note)``.
     """
+    if ltf_bar_ms <= 0:
+        raise ValueError(f"ltf_bar_ms must be positive, got {ltf_bar_ms}.")
     gate = (
         regime is not None
         and regime.enabled
         and regime.gate.at_entry
         and htf is not None
     )
-    timestamps = ltf["timestamp"].to_numpy()
-    start = int(timestamps.searchsorted(tagged_ms, side="left"))
-    if start >= len(ltf):
-        return None, "no LTF data after the tag", 0, ""
+    step = pass_ms if pass_ms > 0 else ltf_bar_ms
+    timestamps = ltf["timestamp"].to_numpy(dtype="int64")
+    if len(timestamps) == 0:
+        return _Confirmation(None, "open")
+    data_end = int(timestamps[-1]) + ltf_bar_ms   # close of the newest LTF bar
 
     suppressed: set[int] = set()
-    last_reason = "no LTF data after the tag"
-    for position in range(start, min(start + horizon, len(ltf))):
-        prefix = ltf.iloc[: position + 1]
-        if len(prefix) < confirm_window // 4:
+    last_reason = "open"
+    passes = 0
+    at = tagged_ms + step
+    while at <= data_end:
+        if deadline_ms is not None and at >= deadline_ms:
+            return _Confirmation(
+                None, death.value if death else "dead", alert_ms=deadline_ms,
+                invalidation=death, suppressed=len(suppressed),
+            )
+        if horizon is not None and passes >= horizon:
+            return _Confirmation(None, last_reason, suppressed=len(suppressed))
+        passes += 1
+        now = at
+        at += step
+
+        visible = int(timestamps.searchsorted(now - ltf_bar_ms, side="right"))
+        if visible < max(confirm_window // 4, 1):
             continue
         trigger, rejection = confirm_entry(
-            prefix,
+            ltf.iloc[:visible],
             zone,
             timeframe=strategy_timeframe,
             strength=swing_strength,
@@ -427,19 +521,31 @@ def _confirm_from_tag(
         )
         if trigger is not None:
             if not gate:
-                return trigger, "confirmed", 0, ""
+                return _Confirmation(trigger, "confirmed", alert_ms=now)
             if trigger.fvg_timestamp in suppressed:
-                continue  # the same trigger, re-found on a longer prefix
+                continue  # the same trigger, re-found on a later pass
             assert regime is not None and htf is not None
             reading = regime.read_at(htf, trigger.fvg_timestamp + ltf_bar_ms)
             if not regime.blocks(reading):
-                return trigger, "confirmed", len(suppressed), reading.reason
+                return _Confirmation(
+                    trigger, "confirmed", alert_ms=now,
+                    suppressed=len(suppressed), regime_note=reading.reason,
+                )
             suppressed.add(trigger.fvg_timestamp)
             last_reason = "regime"
             continue
+        if rejection is not None and rejection.invalidates is not None:
+            return _Confirmation(
+                None, rejection.stage, alert_ms=now,
+                invalidation=rejection.invalidates, suppressed=len(suppressed),
+            )
         if rejection is not None and last_reason != "regime":
             last_reason = rejection.stage
-    return None, last_reason, len(suppressed), ""
+
+    # Data ran out with the zone still alive and waiting.
+    return _Confirmation(
+        None, "regime" if last_reason == "regime" else "open", suppressed=len(suppressed)
+    )
 
 
 def simulate(
@@ -453,7 +559,7 @@ def simulate(
     confirm_window: int,
     ltf_min_fvg_pct: float,
     max_zone_age_ms: int | None = None,
-    confirm_horizon: int = DEFAULT_CONFIRM_HORIZON,
+    confirm_horizon: int | None = DEFAULT_CONFIRM_HORIZON,
 ) -> SimulationReport:
     """Replay the whole pipeline over stored candles and report the funnel."""
     symbols = tuple(frames)
@@ -476,6 +582,8 @@ def simulate(
         ltf = ltf_frames.get(symbol, pd.DataFrame(columns=htf.columns))
         ltf_opens = ltf["timestamp"].to_numpy(dtype="int64") if len(ltf) else []
         ltf_bar_ms = int(np.median(np.diff(ltf_opens))) if len(ltf_opens) > 1 else 0
+        htf_opens = htf["timestamp"].to_numpy(dtype="int64")
+        htf_bar_ms = int(np.median(np.diff(htf_opens))) if len(htf_opens) > 1 else 0
 
         begin = max(strategy.required_candles, 3)
         for index in range(begin, len(htf) + 1):
@@ -542,20 +650,33 @@ def simulate(
                 continue
 
             report.tagged += 1
-            trigger, reason, suppressed, regime_note = _confirm_from_tag(
+            if ltf_bar_ms <= 0:
+                report.ltf_rejections["no LTF data"] += 1
+                continue
+            deadline_ms, death = _tagged_deadline(
+                zone,
+                htf.iloc[index:],
+                max_zone_age_ms=max_zone_age_ms,
+                htf_bar_ms=htf_bar_ms,
+            )
+            result = _confirm_from_tag(
                 ltf,
                 zone,
                 tagged_ms=zone.tagged_ms,
                 strategy_timeframe=ltf_timeframe,
                 confirm_window=confirm_window,
-                horizon=confirm_horizon,
                 min_fvg_pct=ltf_min_fvg_pct,
                 swing_strength=swing_strength,
+                ltf_bar_ms=ltf_bar_ms,
+                pass_ms=htf_bar_ms,
+                deadline_ms=deadline_ms,
+                death=death,
+                horizon=confirm_horizon,
                 regime=strategy.regime,
                 htf=htf,
-                ltf_bar_ms=ltf_bar_ms,
             )
-            report.regime_blocked_triggers += suppressed
+            report.regime_blocked_triggers += result.suppressed
+            trigger = result.trigger
             if trigger is not None:
                 report.confirmed += 1
                 report.per_symbol[symbol] += 1
@@ -584,11 +705,22 @@ def simulate(
                         stop_loss=zone.stop_loss,
                         take_profit=zone.take_profit,
                         quantity=zone.quantity,
-                        regime_note=regime_note,
+                        regime_note=result.regime_note,
+                        alert_ms=result.alert_ms,
                     )
                 )
+            elif result.invalidation is InvalidationReason.STRUCTURE_BREAK:
+                report.tagged_structure_break += 1
+            elif result.invalidation is InvalidationReason.EXPIRED:
+                report.tagged_expired += 1
+            elif result.invalidation is InvalidationReason.STOP_BREACHED:
+                report.stop_breached += 1
+            elif result.invalidation is InvalidationReason.TARGET_REACHED:
+                report.target_reached += 1
+            elif result.reason in ("open", "regime"):
+                report.tagged_open += 1
             else:
-                report.ltf_rejections[reason] += 1
+                report.ltf_rejections[result.reason] += 1   # only with a horizon cap
 
     if starts and ends:
         report.start = datetime.fromtimestamp(min(starts) / 1000, tz=timezone.utc)

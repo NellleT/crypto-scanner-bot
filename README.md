@@ -1,4 +1,12 @@
-# Crypto Scanner Bot v3.1 — Institutional MTF SMC Engine
+# Crypto Scanner Bot v3.1.1 — Institutional MTF SMC Engine
+
+> **Deprecated — do not trade this strategy.** A live-faithful three-year
+> backtest (2023-09 → 2026-09, 7 pairs, realistic orders and fees) lost money in
+> every variant tested. At 1:3 it won **20.1%** of 239 filled trades against the
+> 25% it needs to break even: **−52R after futures fees, −43% of the account at
+> 1% risk**. Keep `DRY_RUN=true`. The numbers are under
+> [Three-year backtest](#three-year-backtest). Its successor, V4.0, is in
+> research.
 
 Finds higher-timeframe **Order Blocks** with genuine displacement at the
 **extremes** of the dealing range, watches them, and only builds an order once
@@ -25,6 +33,22 @@ and a lifecycle.
 | Data | 1h only | **1h + 15m**, fetched concurrently |
 
 Nothing is required to upgrade a v3.0 `.env` — every new key has a default.
+
+## What v3.1.1 changed
+
+* **Dead-on-arrival guard.** LTF confirmation now also requires price to sit
+  strictly between the stop and the target, at both the trigger candle's close
+  and the newest close. Otherwise the zone is retired (`stop_breached` /
+  `target_reached`) instead of alerted. Over three years, 20 of 364 live alerts
+  (5.5%) would have gone out with price already past the target.
+* **The replay is faithful to the live scanner.** The scanner wakes once per 1h
+  close, retires dead zones *before* it looks for a trigger, and keeps a tagged
+  zone until it breaks or ages out. The old replay instead searched every 15m bar
+  for a fixed ten hours with no HTF checks after the tag: it confirmed 135 of 481
+  three-year entries after the live scanner would already have killed the zone,
+  and dated alerts up to 45 minutes before the scanner could send them. Each
+  entry now carries the pass that actually sends it (`alert_utc` in the CSV).
+* **Scheduled GitHub runs are dry-run.** A manual run can still opt out.
 
 ---
 
@@ -112,7 +136,7 @@ Only then is an order built.
 
 `REGIME_FILTER` can halt trend-following entries while the 1h market reads as
 ranging, by ADX, by structural containment, or by both. It is **off by default
-because a year of backtesting says it should be.**
+because three years of backtesting say it should be.**
 
 ### How it decides
 
@@ -130,60 +154,106 @@ because a year of backtesting says it should be.**
 
 ### What the backtest found
 
-1:3, resting limit at the proximal edge, same cached candles for every run.
-In-sample is 2026-03-30 → 2026-09-29; held-out is the 183 days before it, which
-were not used to choose anything.
+Over three years neither variant rescues the strategy (see the variants table
+under [Three-year backtest](#three-year-backtest)). Both trade less, and both lose
+*more per trade* than trading unfiltered: −0.29R (ADX) and −0.30R (structure)
+against −0.22R, after futures fees.
 
-| Variant | In-sample net | Held-out net | Held-out win rate |
-| --- | --- | --- | --- |
-| No filter | **+16R** | −18R | 19.5% |
-| ADX < 20 at entry | −6R | −28R | 12.5% |
-| Structure at admission | +16R | −17R | 8.0% |
+An earlier one-year study here reported +16R in-sample and credited low-ADX
+setups as the strategy's best trades. Those figures came from an outcome model
+with a one-bar lookahead and orders that never expired, run on the unfaithful
+replay fixed in v3.1.1. They are withdrawn.
 
-Why it fails: low-ADX setups were this strategy's *best* trades. Premium/
-discount entries buy the bottom of the dealing range and sell the top, which is
-range trading — so a ranging kill switch removes the regime the strategy
-actually earns in. The structural variant that looked ideal in-sample was one of
-twelve variants tried, and it did not survive the held-out period.
+---
 
-The larger finding is not about the filter: across the full year the base
-strategy is **−2R over 166 trades (expectancy −0.01R, 95% CI −0.28 to +0.25)**.
-There is no demonstrated edge yet. Do not size up on this configuration.
+## Three-year backtest
+
+2023-09-25 → 2026-09-29, all seven pairs, Binance 1h + 15m candles, the defaults
+in `.env.example` at 1:3. Alerts come from the live-faithful replay; each is then
+walked forward on 15m the way a real order would live:
+
+* the order goes in at the scanner pass that sends the alert;
+* a limit that is already through the market fills at once, at market (taker);
+* otherwise it rests (maker), and is cancelled if the target prints first or
+  after 72 hours;
+* the stop is taken first when a candle spans both, and a target inside a
+  resting order's own fill candle is not credited — the order of events inside
+  one candle is unknowable;
+* fees are Binance VIP0: futures 0.02% maker / 0.05% taker, spot 0.10%;
+* slippage is not modelled, which flatters every number below.
+
+| 1:3 | Result |
+| --- | --- |
+| Alerts / filled / cancelled | 344 / 239 / 105 |
+| Win rate | **20.1%** (breakeven 25.0%) |
+| Gross | −38.2R |
+| After futures fees | **−52.3R** (−0.22R per trade, 95% CI −0.48 to +0.04) |
+| After spot fees | −78.7R |
+| Account at 1% risk, futures fees | **−43%** |
+| Worst drawdown / longest losing run | −57.7R / 23 trades |
+
+| Year | Fills | Win rate | Gross | After futures fees |
+| --- | --- | --- | --- | --- |
+| 2023-09 → 2024-09 | 68 | 13.2% | −29.6R | −33.7R |
+| 2024-09 → 2025-09 | 91 | 25.3% | +4.0R | −0.9R |
+| 2025-09 → 2026-09 | 80 | 20.0% | −12.5R | −17.7R |
+
+| Variant | Fills | Win rate (needs) | Gross | Futures fees | Per trade |
+| --- | --- | --- | --- | --- | --- |
+| 1:2 | 166 | 27.1% (33.3%) | −23.6R | −32.8R | −0.20R |
+| **1:3** | 239 | 20.1% (25.0%) | −38.2R | −52.3R | −0.22R |
+| 1:4 | 316 | 15.5% (20.0%) | −60.4R | −80.3R | −0.25R |
+| 1:3, ADX < 20 kill switch at entry | 128 | 18.0% (25.0%) | −30.1R | −37.7R | −0.29R |
+| 1:3, structure filter at admission | 84 | 17.9% (25.0%) | −20.7R | −25.4R | −0.30R |
+| 1:3, orders never cancelled | 339 | 20.4% (25.0%) | −54.2R | −74.2R | −0.22R |
+| 1:3, filled only on a trade through | 238 | 19.7% (25.0%) | −41.2R | −55.3R | −0.23R |
+
+Longs lost far more than shorts (−35.1R against −3.0R gross), and 4 of 12
+quarters were positive after fees. The headline's confidence interval still
+touches zero, so the sample cannot rule out a sliver of edge — but no year,
+variant or rule change was positive after costs, and the best case the
+statistics allow is roughly breakeven. That is not a strategy to put money on.
+
+Figures published here before v3.1.1 (+16R over six months, −2R over a year)
+are superseded: they came from the replay and outcome model fixed in v3.1.1.
 
 ---
 
 ## Measured behaviour
 
-`python main.py --simulate --history 800` over 33 days of 1h candles on all
-seven pairs:
+The replay behind the backtest above — the same report `--simulate` prints
+(`--history 26400` fetches three years):
 
 ```
 -- HTF funnel ----------------------------------------------------
-Order blocks detected                         2468
-  rejected: no FVG                            2169       (87.9%)
-  rejected: FVG < 0.3%                         221        (9.0%)
-  rejected: premium/discount                    36        (1.5%)
-  rejected: stop wider than 3.5%                 3        (0.1%)
+Order blocks detected                        86624
+  rejected: no FVG                           77419       (89.4%)
+  rejected: FVG < 0.3%                        5795        (6.7%)
+  rejected: premium/discount                  1738        (2.0%)
+  rejected: ranging market                       0        (0.0%)
+  rejected: stop wider than 3.5%                43        (0.0%)
   rejected: not sizeable                         0        (0.0%)
-Converted to watchlist                          39        (1.6%)
+Converted to watchlist                        1629        (1.9%)
 
 -- Zone lifecycle ------------------------------------------------
-Tagged (price returned to zone)                 25       (64.1%)
-  invalidated: TP hit before tag                10       (25.6%)
-  invalidated: HTF structure break               2        (5.1%)
-  invalidated: expired                           0        (0.0%)
-  still open at end of data                      2        (5.1%)
+Tagged (price returned to zone)                776       (47.6%)
+  invalidated: TP hit before tag               770       (47.3%)
+  invalidated: HTF structure break              74        (4.5%)
+  invalidated: expired                           8        (0.5%)
+  still open at end of data                      1        (0.1%)
 
 -- LTF confirmation ----------------------------------------------
-CONFIRMED ENTRIES                               18       (46.2%)
-  unconfirmed: choch                             4
-  unconfirmed: in_zone                           2
-  unconfirmed: ltf_fvg                           1
+CONFIRMED ENTRIES                              344       (21.1%)
+  died waiting: HTF structure break            370       (22.7%)
+  died waiting: expired                         42        (2.6%)
+  dead on arrival: through the stop              0        (0.0%)
+  dead on arrival: past the target              20        (1.2%)
+  still waiting at end of data                   0        (0.0%)
 
 -- Signal frequency ----------------------------------------------
-Entries per day (all assets)                  0.54
-Entries per week (all assets)                 3.79
-Entries per day per asset                    0.077
+Entries per day (all assets)                  0.31
+Entries per week (all assets)                 2.19
+Entries per day per asset                    0.045
 ```
 
 Every confirmed entry can be listed for manual verification:
@@ -200,11 +270,11 @@ and checked by hand.
 
 Two numbers worth dwelling on:
 
-* **~1.6% of order blocks reach the watchlist.** The pipeline is severe by
+* **~1.9% of order blocks reach the watchlist.** The pipeline is severe by
   design; most "order blocks" on a 1h chart are not tradable structures.
-* **~26% of watched zones die because price hit the target before returning.**
-  That is the inducement case the MTF design exists to avoid — v3.0 would have
-  rested a limit order into a move that never came back.
+* **~47% of watched zones die because price hit the target before returning,**
+  and nearly half of the zones that are tagged then break structure before the
+  lower timeframe turns. Being selective did not make the survivors profitable.
 
 Counts drift by a candle or two between runs as the newest bar closes; the
 proportions are stable.
@@ -270,7 +340,7 @@ set the HTF depth; the LTF frame is paged automatically to cover the same span.
 | `ADX_PERIOD` / `ADX_THRESHOLD` | `14` / `20` | ADX regime settings. |
 | `REGIME_SWING_STRENGTH` | `5` | Pivot strength for structural containment. |
 | `REGIME_LOOKBACK` | `200` | HTF candles the regime is read over (≤ `CANDLE_LIMIT`). |
-| `DRY_RUN` | `false` | Log alerts instead of sending them. |
+| `DRY_RUN` | `false` | Log alerts instead of sending them. **Keep `true`: v3.1 is deprecated.** |
 
 ---
 
@@ -294,11 +364,12 @@ Trading Bot/
 │   ├── notifier.py          Telegram delivery + dry-run console notifier
 │   ├── bot.py               MTF scan loop, scheduling, shutdown
 │   └── logging_setup.py     console + rotating file handlers
-└── tests/                   164 tests, no network required
+└── tests/                   182 tests, no network required
     ├── test_smc.py          displacement, premium/discount, CHoCH
     ├── test_watchlist.py    lifecycle + persistence
     ├── test_mtf.py          confirmation stages
     ├── test_regime.py       ADX correctness, causality, both gates
+    ├── test_replay.py       replay fidelity to the live scanner's passes
     ├── test_risk.py  test_strategy.py  test_execution.py  test_notifier.py
 ```
 
@@ -357,4 +428,5 @@ or future-schema file starts empty rather than crashing.
 - **CHoCH is a simplification.** It uses a two-pivot lower-high / higher-low
   test, not a full market-structure model with BOS/liquidity labelling.
 - **GitHub Actions cannot run this properly** — Binance restricts its runner IP
-  ranges, and v3.1 needs both timeframes from the execution venue.
+  ranges, and v3.1 needs both timeframes from the execution venue. Scheduled
+  runs are dry-run.

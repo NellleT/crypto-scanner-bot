@@ -11,7 +11,10 @@ change of character. The zone can also die before that ever happens.
        │                             │
        ├── take-profit reached first ┤
        ├── HTF close beyond distal ──┤
-       └── max age exceeded ─────────┴──▶ INVALIDATED
+       ├── max age exceeded ─────────┤
+       │    trigger closes beyond ───┤
+       │    the stop or the target   │
+       └─────────────────────────────┴──▶ INVALIDATED
 
 **Why persistence matters.** The lifecycle spans many candles, but a scheduled
 run is a fresh process. Held only in memory, every zone would be re-created from
@@ -61,12 +64,14 @@ class InvalidationReason(str, Enum):
     TP_BEFORE_TAG = "tp_before_tag"        # liquidity already swept
     STRUCTURE_BREAK = "structure_break"    # HTF closed beyond the distal edge
     EXPIRED = "expired"                    # too old to be relevant
+    STOP_BREACHED = "stop_breached"        # trigger formed with price through the stop
+    TARGET_REACHED = "target_reached"      # trigger formed with price past the target
 
     @property
     def detail(self) -> str:
         return {
             InvalidationReason.TP_BEFORE_TAG: (
-                "price reached the 1:4 target before returning to the zone — the "
+                "price reached the target before returning to the zone — the "
                 "move happened without us and the liquidity is gone"
             ),
             InvalidationReason.STRUCTURE_BREAK: (
@@ -74,6 +79,14 @@ class InvalidationReason(str, Enum):
                 "extreme that defined the zone no longer holds"
             ),
             InvalidationReason.EXPIRED: "zone exceeded its maximum age",
+            InvalidationReason.STOP_BREACHED: (
+                "the LTF trigger formed with price already closed through the "
+                "stop — the setup failed before it could be entered"
+            ),
+            InvalidationReason.TARGET_REACHED: (
+                "the LTF trigger formed with price already closed past the "
+                "target — the move finished before it could be entered"
+            ),
         }[self]
 
 
@@ -339,6 +352,15 @@ class Watchlist:
         zone.state = WatchState.INVALIDATED
         zone.invalidation = reason
         return ZoneEvent(zone, "invalidated", reason.detail)
+
+    def invalidate(self, zone: WatchedZone, reason: InvalidationReason) -> ZoneEvent:
+        """Retire a zone for a reason found outside the HTF update.
+
+        LTF confirmation can discover that a setup is already dead — its trigger
+        formed with price through the stop — and must be able to say so, or the
+        same stale trigger would be re-found on every later pass.
+        """
+        return self._invalidate(zone, reason)
 
     def mark_triggered(self, zone: WatchedZone, *, when_ms: int) -> None:
         zone.state = WatchState.TRIGGERED

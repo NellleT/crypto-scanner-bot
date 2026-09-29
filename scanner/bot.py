@@ -277,6 +277,8 @@ class ScannerBot:
                     funnel["confirmed"] += 1
                 elif suppressed:
                     funnel["regime_suppressed"] += 1
+                elif zone.state is WatchState.INVALIDATED:
+                    funnel["zone_invalidated"] += 1
                 else:
                     funnel["awaiting_ltf"] += 1
 
@@ -306,11 +308,14 @@ class ScannerBot:
     ) -> tuple[LtfTrigger | None, bool]:
         """Look for an LTF trigger on a tagged zone and dispatch if found.
 
-        Returns ``(trigger, suppressed)``. With an entry-gated regime filter, a
-        trigger that completed while the HTF read as ranging is suppressed: the
-        zone stays tagged, so a later trigger completing in a trending reading can
-        still fire. The regime is read at the moment the trigger candle closed,
-        from HTF candles closed by then — the same rule the replay applies.
+        Returns ``(trigger, suppressed)``. A trigger that formed with price
+        already through the stop (or past the target) retires the zone instead
+        of dispatching; the caller sees the zone as INVALIDATED. With an
+        entry-gated regime filter, a trigger that completed while the HTF read as
+        ranging is suppressed: the zone stays tagged, so a later trigger
+        completing in a trending reading can still fire. The regime is read at the
+        moment the trigger candle closed, from HTF candles closed by then — the
+        same rule the replay applies.
         """
         trigger, rejection = confirm_entry(
             ltf,
@@ -321,7 +326,12 @@ class ScannerBot:
             min_fvg_pct=self._settings.ltf_min_fvg_pct,
         )
         if trigger is None:
-            if rejection is not None:
+            if rejection is not None and rejection.invalidates is not None:
+                # Dead on arrival: retire the zone, or the same stale trigger is
+                # re-found every pass and could fire once price drifts back.
+                self._watchlist.invalidate(zone, rejection.invalidates)
+                logger.info("%s: zone invalidated — %s", zone.symbol, rejection.reason)
+            elif rejection is not None:
                 logger.debug("%s: %s", zone.symbol, rejection.reason)
             return None, False
 

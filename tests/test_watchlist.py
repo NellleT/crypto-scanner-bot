@@ -313,3 +313,17 @@ def test_counts_break_down_by_state_and_reason() -> None:
     assert counts["pending"] == 1
     assert counts["invalidated"] == 1
     assert counts["invalidated_tp_before_tag"] == 1
+
+
+def test_a_zone_can_be_retired_from_outside_the_htf_update() -> None:
+    """LTF confirmation finds dead-on-arrival setups and must be able to say so."""
+    watchlist = Watchlist()
+    zone = make_zone()
+    watchlist.add(zone)
+    event = watchlist.invalidate(zone, InvalidationReason.STOP_BREACHED)
+    assert zone.state is WatchState.INVALIDATED
+    assert zone.invalidation is InvalidationReason.STOP_BREACHED
+    assert event.kind == "invalidated"
+    assert watchlist.active() == []
+    # And it survives a round-trip through disk like any other reason.
+    assert WatchedZone.from_dict(zone.to_dict()).invalidation is InvalidationReason.STOP_BREACHED

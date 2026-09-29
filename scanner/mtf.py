@@ -10,7 +10,11 @@ Confirmation requires, in order:
 2. an LTF **Change of Character** in the direction of the HTF setup — the first
    break against the short-term structure that carried price into the zone;
 3. an LTF **Fair Value Gap** in the same direction, formed at or after the
-   CHoCH, evidencing that the turn had displacement behind it.
+   CHoCH, evidencing that the turn had displacement behind it;
+4. price still **between the stop and the target** — both the trigger candle's
+   close and the newest close. A turn can complete entirely beyond the stop
+   (price swept below a long zone and turned while still under it); alerting
+   that sends an order whose stop has already been traded through.
 
 The CHoCH bar is located by replaying :func:`~scanner.smc.detect_choch` over the
 tail of the frame rather than by re-deriving pivot logic here, so the live path
@@ -35,7 +39,7 @@ from scanner.smc import (
     detect_choch,
     fvg_frame,
 )
-from scanner.watchlist import WatchedZone
+from scanner.watchlist import InvalidationReason, WatchedZone
 
 logger: Final[logging.Logger] = logging.getLogger(__name__)
 
@@ -70,10 +74,16 @@ class LtfTrigger:
 
 @dataclass(frozen=True, slots=True)
 class ConfirmationRejection:
-    """Why the lower timeframe has not confirmed a tagged zone."""
+    """Why the lower timeframe has not confirmed a tagged zone.
 
-    stage: str   # in_zone | choch | ltf_fvg
+    Most rejections mean "not yet" and the zone keeps waiting. When
+    ``invalidates`` is set the setup is dead, and the caller must retire the zone
+    with that reason rather than look again next pass.
+    """
+
+    stage: str   # in_zone | choch | ltf_fvg | stop_breached | target_reached
     reason: str
+    invalidates: InvalidationReason | None = None
 
 
 def find_choch(
@@ -210,6 +220,29 @@ def confirm_entry(
         )
 
     fvg_position, fvg_pct = found
+
+    # 4. Price must still be where the order makes sense. Checked on closes,
+    # like every other invalidation here: a wick through the stop that closes
+    # back inside is a sweep, not a failure.
+    closes = (float(recent["close"].iloc[fvg_position]), float(recent["close"].iloc[-1]))
+    long_ = zone.direction.is_long
+    if any((c <= zone.stop_loss) if long_ else (c >= zone.stop_loss) for c in closes):
+        return None, ConfirmationRejection(
+            "stop_breached",
+            f"{zone.direction.value} trigger formed with price closed at "
+            f"{min(closes) if long_ else max(closes):g}, through the "
+            f"{zone.stop_loss:g} stop — dead on arrival, zone retired",
+            InvalidationReason.STOP_BREACHED,
+        )
+    if any((c >= zone.take_profit) if long_ else (c <= zone.take_profit) for c in closes):
+        return None, ConfirmationRejection(
+            "target_reached",
+            f"{zone.direction.value} trigger formed with price closed at "
+            f"{max(closes) if long_ else min(closes):g}, past the "
+            f"{zone.take_profit:g} target — the move is over, zone retired",
+            InvalidationReason.TARGET_REACHED,
+        )
+
     return (
         LtfTrigger(
             direction=zone.direction,

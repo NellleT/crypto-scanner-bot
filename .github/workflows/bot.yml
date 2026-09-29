@@ -16,7 +16,7 @@ on:
       dry_run:
         description: 'Log alerts instead of sending them'
         type: boolean
-        default: false
+        default: true
 
 concurrency:
   # A late run must not overlap the next scheduled one.
@@ -62,7 +62,10 @@ jobs:
           SYMBOLS: ${{ secrets.SYMBOLS }}
           ACCOUNT_EQUITY: ${{ secrets.ACCOUNT_EQUITY }}
           TIMEFRAME: ${{ secrets.TIMEFRAME }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          # v3.1 is deprecated, so scheduled runs never send alerts. On a
+          # schedule `inputs` is empty, which used to fall through to the config
+          # default (false); only a manual run can now opt out of dry-run.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry_run) || 'true' }}
         run: |
           # --once is required: the default mode runs forever, which on a cron
           # schedule would pin a job until the timeout and overlap the next run.

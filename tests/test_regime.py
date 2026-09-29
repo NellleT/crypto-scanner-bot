@@ -266,11 +266,12 @@ def confirm(regime: RegimeFilter | None):
     first = int(frame["timestamp"].iloc[0])
     htf = random_walk(80)
     htf["timestamp"] = first - (80 - np.arange(80)) * _HOUR_MS   # all closed before
-    return _confirm_from_tag(
+    result = _confirm_from_tag(
         frame, make_zone(), tagged_ms=first, strategy_timeframe="15m",
-        confirm_window=30, horizon=40, min_fvg_pct=0.0, swing_strength=1,
+        confirm_window=30, min_fvg_pct=0.0, swing_strength=1,
         regime=regime, htf=htf, ltf_bar_ms=15 * 60_000,
     )
+    return result.trigger, result.reason, result.suppressed, result.regime_note
 
 
 def test_entry_gate_suppresses_a_trigger_while_ranging() -> None:
