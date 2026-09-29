@@ -21,9 +21,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Final, Mapping, Sequence
 
+import numpy as np
 import pandas as pd
 
 from scanner.mtf import LtfTrigger, confirm_entry
+from scanner.regime import RegimeFilter
 from scanner.smc import Direction
 from scanner.strategy import FilterStage, OrderBlockStrategy
 from scanner.watchlist import InvalidationReason, WatchedZone, WatchState
@@ -72,6 +74,7 @@ class ConfirmedEntry:
     stop_loss: float
     take_profit: float
     quantity: float
+    regime_note: str = ""
 
     @staticmethod
     def _at(ms: int) -> datetime:
@@ -135,6 +138,7 @@ class SimulationReport:
     fvg_rejected: int = 0             # no gap at all
     displacement_rejected: int = 0    # gap below min_fvg_pct
     pd_rejected: int = 0              # wrong half of the dealing range
+    regime_rejected: int = 0          # ranging market at admission
     stop_width_rejected: int = 0      # stop wider than max_stop_pct
     risk_rejected: int = 0            # not sizeable
     watchlist: int = 0                # accepted onto the watchlist
@@ -146,6 +150,7 @@ class SimulationReport:
     expired: int = 0
     still_open: int = 0
     confirmed: int = 0                # LTF-confirmed entries
+    regime_blocked_triggers: int = 0  # LTF triggers suppressed while ranging
 
     # LTF rejection breakdown
     ltf_rejections: Counter[str] = field(default_factory=Counter)
@@ -191,6 +196,7 @@ class SimulationReport:
             f"detected={self.detected}, "
             f"fvg_rejected={self.fvg_rejected + self.displacement_rejected}, "
             f"pd_rejected={self.pd_rejected}, "
+            f"regime_rejected={self.regime_rejected}, "
             f"stop_width_rejected={self.stop_width_rejected}, "
             f"final_watchlist={self.watchlist}"
         )
@@ -221,6 +227,8 @@ class SimulationReport:
             f"{self._pct(self.displacement_rejected, self.detected):>14}",
             f"{'  rejected: premium/discount':<40}{self.pd_rejected:>10}"
             f"{self._pct(self.pd_rejected, self.detected):>14}",
+            f"{'  rejected: ranging market':<40}{self.regime_rejected:>10}"
+            f"{self._pct(self.regime_rejected, self.detected):>14}",
             f"{'  rejected: stop wider than ' + f'{self.max_stop_pct:g}%':<40}"
             f"{self.stop_width_rejected:>10}"
             f"{self._pct(self.stop_width_rejected, self.detected):>14}",
@@ -245,6 +253,10 @@ class SimulationReport:
             f"{'CONFIRMED ENTRIES':<40}{self.confirmed:>10}"
             f"{self._pct(self.confirmed, self.watchlist):>14}",
         ]
+        if self.regime_blocked_triggers:
+            lines.append(
+                f"{'  triggers suppressed (ranging)':<40}{self.regime_blocked_triggers:>10}"
+            )
 
         for stage, count in self.ltf_rejections.most_common():
             lines.append(f"{'  unconfirmed: ' + stage:<40}{count:>10}")
@@ -328,8 +340,10 @@ class SimulationReport:
                 f"  target {_money(entry.take_profit)}"
                 f"   risk {entry.risk_pct:.2f}%  R:R 1:{entry.reward_ratio:.0f}"
                 f"  qty {entry.quantity:,.4f}".rstrip("0").rstrip("."),
-                "",
             ]
+            if entry.regime_note:
+                lines.append(f"     regime    : {entry.regime_note}")
+            lines.append("")
 
         lines.append("=" * width)
         return "\n".join(lines)
@@ -365,7 +379,10 @@ def _confirm_from_tag(
     horizon: int,
     min_fvg_pct: float,
     swing_strength: int,
-) -> tuple[LtfTrigger | None, str]:
+    regime: RegimeFilter | None = None,
+    htf: pd.DataFrame | None = None,
+    ltf_bar_ms: int = 0,
+) -> tuple[LtfTrigger | None, str, int, str]:
     """Search forward from a tag for an LTF confirmation.
 
     Only candles that closed at or after the tag are visible, so the simulation
@@ -374,12 +391,27 @@ def _confirm_from_tag(
     Returns the trigger itself rather than a flag, so the caller can record the
     exact CHoCH and gap timestamps an entry was accepted on — without them a
     reported entry cannot be checked against a chart.
+
+    With an entry-gated regime filter, a trigger that completes while the HTF
+    reads as ranging is suppressed but the zone keeps waiting: a later trigger
+    that completes in a trending reading can still fire, which is what the live
+    scanner does. The regime is read at the moment the trigger candle CLOSES,
+    from HTF candles that had closed by then.
+
+    Returns ``(trigger, reason, suppressed, regime_note)``.
     """
+    gate = (
+        regime is not None
+        and regime.enabled
+        and regime.gate.at_entry
+        and htf is not None
+    )
     timestamps = ltf["timestamp"].to_numpy()
     start = int(timestamps.searchsorted(tagged_ms, side="left"))
     if start >= len(ltf):
-        return None, "no LTF data after the tag"
+        return None, "no LTF data after the tag", 0, ""
 
+    suppressed: set[int] = set()
     last_reason = "no LTF data after the tag"
     for position in range(start, min(start + horizon, len(ltf))):
         prefix = ltf.iloc[: position + 1]
@@ -394,10 +426,20 @@ def _confirm_from_tag(
             min_fvg_pct=min_fvg_pct,
         )
         if trigger is not None:
-            return trigger, "confirmed"
-        if rejection is not None:
+            if not gate:
+                return trigger, "confirmed", 0, ""
+            if trigger.fvg_timestamp in suppressed:
+                continue  # the same trigger, re-found on a longer prefix
+            assert regime is not None and htf is not None
+            reading = regime.read_at(htf, trigger.fvg_timestamp + ltf_bar_ms)
+            if not regime.blocks(reading):
+                return trigger, "confirmed", len(suppressed), reading.reason
+            suppressed.add(trigger.fvg_timestamp)
+            last_reason = "regime"
+            continue
+        if rejection is not None and last_reason != "regime":
             last_reason = rejection.stage
-    return None, last_reason
+    return None, last_reason, len(suppressed), ""
 
 
 def simulate(
@@ -432,6 +474,8 @@ def simulate(
         starts.append(int(htf["timestamp"].iloc[0]))
         ends.append(int(htf["timestamp"].iloc[-1]))
         ltf = ltf_frames.get(symbol, pd.DataFrame(columns=htf.columns))
+        ltf_opens = ltf["timestamp"].to_numpy(dtype="int64") if len(ltf) else []
+        ltf_bar_ms = int(np.median(np.diff(ltf_opens))) if len(ltf_opens) > 1 else 0
 
         begin = max(strategy.required_candles, 3)
         for index in range(begin, len(htf) + 1):
@@ -452,6 +496,9 @@ def simulate(
                 continue
             if stage is FilterStage.PREMIUM_DISCOUNT:
                 report.pd_rejected += 1
+                continue
+            if stage is FilterStage.REGIME:
+                report.regime_rejected += 1
                 continue
             if stage is FilterStage.STOP_WIDTH:
                 report.stop_width_rejected += 1
@@ -495,7 +542,7 @@ def simulate(
                 continue
 
             report.tagged += 1
-            trigger, reason = _confirm_from_tag(
+            trigger, reason, suppressed, regime_note = _confirm_from_tag(
                 ltf,
                 zone,
                 tagged_ms=zone.tagged_ms,
@@ -504,7 +551,11 @@ def simulate(
                 horizon=confirm_horizon,
                 min_fvg_pct=ltf_min_fvg_pct,
                 swing_strength=swing_strength,
+                regime=strategy.regime,
+                htf=htf,
+                ltf_bar_ms=ltf_bar_ms,
             )
+            report.regime_blocked_triggers += suppressed
             if trigger is not None:
                 report.confirmed += 1
                 report.per_symbol[symbol] += 1
@@ -533,6 +584,7 @@ def simulate(
                         stop_loss=zone.stop_loss,
                         take_profit=zone.take_profit,
                         quantity=zone.quantity,
+                        regime_note=regime_note,
                     )
                 )
             else:

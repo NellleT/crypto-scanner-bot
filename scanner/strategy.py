@@ -12,6 +12,8 @@ Stage              Requirement
 ``displacement``   That gap is at least ``min_fvg_pct`` of price
 ``premium_discount`` The block sits in the correct half of the dealing
                    range — discount for longs, premium for shorts
+``regime``         The market is not ranging (only when the regime filter
+                   is enabled with an admission gate)
 ``stop_width``     The resulting stop is within ``max_stop_pct`` of entry
 ``risk``           Entry, stop, target and size are all expressible
 ``watchlist``      Accepted; the zone is now tracked toward an entry
@@ -42,6 +44,7 @@ from scanner.risk import (
     TradePlan,
     build_trade_plan,
 )
+from scanner.regime import RegimeFilter
 from scanner.smc import (
     DEFAULT_MIN_FVG_PCT,
     DEFAULT_RANGE_LOOKBACK,
@@ -67,6 +70,7 @@ class FilterStage(str, Enum):
     FVG = "fvg"
     DISPLACEMENT = "displacement"
     PREMIUM_DISCOUNT = "premium_discount"
+    REGIME = "regime"
     STOP_WIDTH = "stop_width"
     RISK = "risk"
     WATCHLIST = "watchlist"
@@ -99,6 +103,11 @@ class FilterStage(str, Enum):
     def reached_spatial(self) -> bool:
         """True when the block was also on the right side of the range."""
         return self.passed(FilterStage.PREMIUM_DISCOUNT)
+
+    @property
+    def reached_regime(self) -> bool:
+        """True when the market regime also permitted a trend entry."""
+        return self.passed(FilterStage.REGIME)
 
     @property
     def reached_stop_width(self) -> bool:
@@ -174,6 +183,7 @@ class OrderBlockStrategy:
     require_extreme: bool = True
     stop_buffer_pct: float = DEFAULT_STOP_BUFFER_PCT
     max_stop_pct: float = DEFAULT_MAX_STOP_PCT
+    regime: RegimeFilter = RegimeFilter()
     reward_ratio: float = DEFAULT_REWARD_RATIO
     account_equity: float = DEFAULT_ACCOUNT_EQUITY
     risk_per_trade_pct: float = DEFAULT_RISK_PER_TRADE_PCT
@@ -207,6 +217,19 @@ class OrderBlockStrategy:
                 _SMC_STAGE.get(rejection.stage, FilterStage.ORDER_BLOCK),
                 rejection.reason,
             )
+
+        # Regime kill switch at admission: a structure that forms while the
+        # market is ranging is not tracked at all. Checked after the structural
+        # filters because it is the more expensive computation, and they reject
+        # all but a few percent of bars first.
+        if self.regime.enabled and self.regime.gate.at_admission:
+            reading = self.regime.read(df)
+            if self.regime.blocks(reading):
+                return StrategyResult.rejected(
+                    FilterStage.REGIME,
+                    f"{block.direction.value} order block rejected: market is "
+                    f"ranging ({reading.reason}) — trend entries are halted",
+                )
 
         plan = build_trade_plan(
             block,

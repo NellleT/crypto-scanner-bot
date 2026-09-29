@@ -108,6 +108,50 @@ Only then is an order built.
 
 ---
 
+## Regime filter (kill switch) — available, off by default
+
+`REGIME_FILTER` can halt trend-following entries while the 1h market reads as
+ranging, by ADX, by structural containment, or by both. It is **off by default
+because a year of backtesting says it should be.**
+
+### How it decides
+
+* **ADX** — Wilder's ADX(14) below `ADX_THRESHOLD` (20) reads as ranging.
+  Verified against `pandas-ta-classic` to within 1e-4.
+* **Structure** — the last confirmed swing high and low bound a range; the
+  market is ranging until a candle closes with its *whole body* beyond a bound.
+  Wicks through a bound are sweeps and do not count.
+* Both are causal: a pivot is only treated as known `REGIME_SWING_STRENGTH`
+  bars after it prints, and a reading at time *t* uses only candles closed by
+  *t*. The backtest and the live scanner apply the identical rule.
+* `REGIME_GATE` chooses where it acts: at zone **admission**, at the LTF
+  **entry** trigger, or **both**. An entry-gated zone is not discarded — it
+  waits, and a later trigger in a trending reading can still fire.
+
+### What the backtest found
+
+1:3, resting limit at the proximal edge, same cached candles for every run.
+In-sample is 2026-03-30 → 2026-09-29; held-out is the 183 days before it, which
+were not used to choose anything.
+
+| Variant | In-sample net | Held-out net | Held-out win rate |
+| --- | --- | --- | --- |
+| No filter | **+16R** | −18R | 19.5% |
+| ADX < 20 at entry | −6R | −28R | 12.5% |
+| Structure at admission | +16R | −17R | 8.0% |
+
+Why it fails: low-ADX setups were this strategy's *best* trades. Premium/
+discount entries buy the bottom of the dealing range and sell the top, which is
+range trading — so a ranging kill switch removes the regime the strategy
+actually earns in. The structural variant that looked ideal in-sample was one of
+twelve variants tried, and it did not survive the held-out period.
+
+The larger finding is not about the filter: across the full year the base
+strategy is **−2R over 166 trades (expectancy −0.01R, 95% CI −0.28 to +0.25)**.
+There is no demonstrated edge yet. Do not size up on this configuration.
+
+---
+
 ## Measured behaviour
 
 `python main.py --simulate --history 800` over 33 days of 1h candles on all
@@ -221,6 +265,11 @@ set the HTF depth; the LTF frame is paged automatically to cover the same span.
 | `REWARD_RATIO` | `4` | Take-profit R-multiple. |
 | `ACCOUNT_EQUITY` | `10000` | **Stale values mis-size every order.** |
 | `RISK_PER_TRADE_PCT` | `1` | Percent of equity risked per trade. |
+| `REGIME_FILTER` | `off` | Kill switch: `off`, `adx`, `structure`, `confluence`. |
+| `REGIME_GATE` | `entry` | Where it acts: `admission`, `entry`, `both`. |
+| `ADX_PERIOD` / `ADX_THRESHOLD` | `14` / `20` | ADX regime settings. |
+| `REGIME_SWING_STRENGTH` | `5` | Pivot strength for structural containment. |
+| `REGIME_LOOKBACK` | `200` | HTF candles the regime is read over (≤ `CANDLE_LIMIT`). |
 | `DRY_RUN` | `false` | Log alerts instead of sending them. |
 
 ---
@@ -240,14 +289,16 @@ Trading Bot/
 │   ├── mtf.py               lower-timeframe confirmation — no I/O
 │   ├── execution.py         Binance order payloads — no I/O
 │   ├── analytics.py         historical replay + funnel report
+│   ├── regime.py            ADX + structural regime, kill switch — no I/O
 │   ├── strategy.py          HTF filter chain, typed rejection stages
 │   ├── notifier.py          Telegram delivery + dry-run console notifier
 │   ├── bot.py               MTF scan loop, scheduling, shutdown
 │   └── logging_setup.py     console + rotating file handlers
-└── tests/                   128 tests, no network required
+└── tests/                   164 tests, no network required
     ├── test_smc.py          displacement, premium/discount, CHoCH
     ├── test_watchlist.py    lifecycle + persistence
     ├── test_mtf.py          confirmation stages
+    ├── test_regime.py       ADX correctness, causality, both gates
     ├── test_risk.py  test_strategy.py  test_execution.py  test_notifier.py
 ```
 

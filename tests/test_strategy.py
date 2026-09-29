@@ -194,6 +194,7 @@ def test_stage_depth_follows_declaration_order() -> None:
         FilterStage.FVG,
         FilterStage.DISPLACEMENT,
         FilterStage.PREMIUM_DISCOUNT,
+        FilterStage.REGIME,
         FilterStage.STOP_WIDTH,
         FilterStage.RISK,
         FilterStage.WATCHLIST,

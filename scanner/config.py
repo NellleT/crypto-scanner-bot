@@ -28,6 +28,14 @@ from scanner.mtf import (
     DEFAULT_CONFIRM_WINDOW,
     DEFAULT_LTF_MIN_FVG_PCT,
 )
+from scanner.regime import (
+    DEFAULT_ADX_PERIOD,
+    DEFAULT_ADX_THRESHOLD,
+    DEFAULT_REGIME_LOOKBACK,
+    DEFAULT_REGIME_SWING_STRENGTH,
+    RegimeGate,
+    RegimeMethod,
+)
 from scanner.smc import (
     DEFAULT_MIN_FVG_PCT,
     DEFAULT_RANGE_LOOKBACK,
@@ -167,6 +175,18 @@ def _get_bool(key: str, default: bool) -> bool:
     raise ConfigError(f"{key} must be a boolean-like value, got {raw!r}.")
 
 
+def _get_enum(key: str, enum_type, default):
+    """Parse an enum-valued setting by its value, case-insensitively."""
+    raw = _get_str(key).lower()
+    if not raw:
+        return default
+    try:
+        return enum_type(raw)
+    except ValueError as exc:
+        allowed = ", ".join(member.value for member in enum_type)
+        raise ConfigError(f"{key} must be one of: {allowed}; got {raw!r}.") from exc
+
+
 #: Seconds per timeframe unit, for ordering HTF against LTF without CCXT.
 _UNIT_SECONDS: Final[dict[str, int]] = {
     "m": 60,
@@ -243,6 +263,12 @@ class Settings:
     watchlist_file: Path
     stop_buffer_pct: float
     max_stop_pct: float
+    regime_method: RegimeMethod
+    regime_gate: RegimeGate
+    adx_period: int
+    adx_threshold: float
+    regime_swing_strength: int
+    regime_lookback: int
     reward_ratio: float
     account_equity: float
     risk_per_trade_pct: float
@@ -321,6 +347,26 @@ class Settings:
                 "Raise CANDLE_LIMIT or lower RANGE_LOOKBACK."
             )
 
+        regime_method = _get_enum("REGIME_FILTER", RegimeMethod, RegimeMethod.OFF)
+        regime_gate = _get_enum("REGIME_GATE", RegimeGate, RegimeGate.ENTRY)
+        adx_period = _get_int("ADX_PERIOD", DEFAULT_ADX_PERIOD, minimum=2, maximum=200)
+        regime_lookback = _get_int(
+            "REGIME_LOOKBACK", DEFAULT_REGIME_LOOKBACK, minimum=10, maximum=MAX_CANDLE_LIMIT
+        )
+        if regime_method is not RegimeMethod.OFF:
+            if regime_lookback > candle_limit:
+                raise ConfigError(
+                    f"REGIME_LOOKBACK={regime_lookback} exceeds CANDLE_LIMIT={candle_limit}: "
+                    "the regime would be read over more history than a live pass "
+                    "fetches, so the backtest and the scanner would disagree."
+                )
+            if regime_lookback < 3 * adx_period:
+                raise ConfigError(
+                    f"REGIME_LOOKBACK={regime_lookback} is too short for "
+                    f"ADX_PERIOD={adx_period}: at least {3 * adx_period} candles are "
+                    "needed before ADX stops carrying its arbitrary starting value."
+                )
+
         log_file_raw = _get_str("LOG_FILE")
         log_file = Path(log_file_raw).expanduser() if log_file_raw else None
         if log_file is not None and not log_file.is_absolute():
@@ -375,6 +421,16 @@ class Settings:
             max_stop_pct=_get_float(
                 "MAX_STOP_PCT", DEFAULT_MAX_STOP_PCT, minimum=0.0, maximum=100.0
             ),
+            regime_method=regime_method,
+            regime_gate=regime_gate,
+            adx_period=adx_period,
+            adx_threshold=_get_float(
+                "ADX_THRESHOLD", DEFAULT_ADX_THRESHOLD, minimum=1.0, maximum=100.0
+            ),
+            regime_swing_strength=_get_int(
+                "REGIME_SWING_STRENGTH", DEFAULT_REGIME_SWING_STRENGTH, minimum=1, maximum=50
+            ),
+            regime_lookback=regime_lookback,
             reward_ratio=_get_float(
                 "REWARD_RATIO", DEFAULT_REWARD_RATIO, minimum=0.1, maximum=100.0
             ),
@@ -409,6 +465,8 @@ class Settings:
             f"min_body_ratio={self.min_body_ratio:g} "
             f"candles={self.candle_limit}/{self.ltf_candle_limit} "
             f"stop=distal±{self.stop_buffer_pct:g}% max_stop={self.max_stop_pct:g}% "
+            f"regime={self.regime_method.value}"
+            f"{'@' + self.regime_gate.value if self.regime_method is not RegimeMethod.OFF else ''} "
             f"target=1:{self.reward_ratio:g} "
             f"risk={self.risk_per_trade_pct:g}% of {self.account_equity:,.2f} "
             f"dry_run={self.dry_run}"

@@ -33,6 +33,7 @@ from scanner.exchange import MarketDataClient, MarketDataError
 from scanner.execution import ExecutionOrder, build_execution_order
 from scanner.mtf import LtfTrigger, confirm_entry
 from scanner.notifier import ConsoleNotifier, Notifier, TelegramNotifier
+from scanner.regime import RegimeFilter
 from scanner.strategy import FilterStage, OrderBlockStrategy, StrategyResult, TradeSignal
 from scanner.watchlist import WatchedZone, Watchlist, WatchState
 
@@ -73,6 +74,14 @@ class ScannerBot:
             require_extreme=settings.require_extreme,
             stop_buffer_pct=settings.stop_buffer_pct,
             max_stop_pct=settings.max_stop_pct,
+            regime=RegimeFilter(
+                method=settings.regime_method,
+                gate=settings.regime_gate,
+                adx_period=settings.adx_period,
+                adx_threshold=settings.adx_threshold,
+                swing_strength=settings.regime_swing_strength,
+                lookback=settings.regime_lookback,
+            ),
             reward_ratio=settings.reward_ratio,
             account_equity=settings.account_equity,
             risk_per_trade_pct=settings.risk_per_trade_pct,
@@ -260,10 +269,14 @@ class ScannerBot:
                 frame = ltf_frames.get(zone.symbol)
                 if frame is None:
                     continue
-                trigger = self._try_confirm(zone, frame)
+                trigger, suppressed = self._try_confirm(
+                    zone, frame, htf_frames.get(zone.symbol)
+                )
                 if trigger is not None:
                     triggers.append(trigger)
                     funnel["confirmed"] += 1
+                elif suppressed:
+                    funnel["regime_suppressed"] += 1
                 else:
                     funnel["awaiting_ltf"] += 1
 
@@ -285,8 +298,20 @@ class ScannerBot:
         )
         return self._watchlist.add(zone)
 
-    def _try_confirm(self, zone: WatchedZone, ltf: pd.DataFrame) -> LtfTrigger | None:
-        """Look for an LTF trigger on a tagged zone and dispatch if found."""
+    def _try_confirm(
+        self,
+        zone: WatchedZone,
+        ltf: pd.DataFrame,
+        htf: pd.DataFrame | None = None,
+    ) -> tuple[LtfTrigger | None, bool]:
+        """Look for an LTF trigger on a tagged zone and dispatch if found.
+
+        Returns ``(trigger, suppressed)``. With an entry-gated regime filter, a
+        trigger that completed while the HTF read as ranging is suppressed: the
+        zone stays tagged, so a later trigger completing in a trending reading can
+        still fire. The regime is read at the moment the trigger candle closed,
+        from HTF candles closed by then — the same rule the replay applies.
+        """
         trigger, rejection = confirm_entry(
             ltf,
             zone,
@@ -298,11 +323,24 @@ class ScannerBot:
         if trigger is None:
             if rejection is not None:
                 logger.debug("%s: %s", zone.symbol, rejection.reason)
-            return None
+            return None, False
+
+        regime = self._strategy.regime
+        if regime.enabled and regime.gate.at_entry and htf is not None and len(ltf) > 1:
+            ltf_bar_ms = int(ltf["timestamp"].diff().median())
+            reading = regime.read_at(htf, trigger.fvg_timestamp + ltf_bar_ms)
+            if regime.blocks(reading):
+                logger.info(
+                    "%s: %s entry suppressed — %s. Zone stays tagged.",
+                    zone.symbol,
+                    zone.direction.value,
+                    reading.reason,
+                )
+                return None, True
 
         self._watchlist.mark_triggered(zone, when_ms=trigger.fvg_timestamp)
         self._dispatch(zone, trigger)
-        return trigger
+        return trigger, False
 
     def _log_funnel(self, funnel: Counter[str]) -> None:
         """Report where candidates dropped out, so filtering is observable.
@@ -317,6 +355,7 @@ class ScannerBot:
             "zone_added",
             "zone_tagged",
             "zone_invalidated",
+            "regime_suppressed",
             "awaiting_ltf",
             "confirmed",
             "error",
