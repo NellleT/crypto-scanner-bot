@@ -1,6 +1,7 @@
 # Crypto Scanner Bot v5.0 — daily trend-following, paper trading
 
-> **Status: V5.0 paper-trades once a day on GitHub Actions. No real orders.**
+> **Status: V5.0 paper-trades once a day on GitHub Actions and reports to
+> Telegram as `[PAPER_TRADE]`. No real orders — the bot cannot place any.**
 > It buys a coin whose daily close breaks its 20-day high while above its
 > 200-day average, and sells when a daily close breaks the 10-day low. It passed
 > a pre-registered 2018–2026 backtest
@@ -31,15 +32,17 @@ runs `python main.py --paper --dry-run`, which:
 1. fetches the seven pairs' closed daily candles from Binance;
 2. rebuilds the paper account from `PAPER_START` (2026-09-30, $10,000) by
    replaying the V5 rules through the same engine the backtest uses;
-3. logs the day's alerts —
-   * `[PAPER] BUY SOL/USDT — daily close … broke the 20-day high …` (bought at
-     the next open),
-   * `[PAPER] SELL ETH/USDT (Trailing Stop Hit) — daily close … fell below the
-     10-day low …` (sold at the next open),
-   * `[PAPER] V5 daily status — …` (equity, cash, and every open position with
-     its trailing stop);
+3. sends the day's messages to Telegram, and logs them —
+   * `[PAPER_TRADE] BUY SOL/USDT` — the breakout, the paper size and the
+     trailing stop (bought at the next open),
+   * `[PAPER_TRADE] SELL ETH/USDT (Trailing Stop Hit)` — the channel break and
+     the trade's result so far (sold at the next open),
+   * `[PAPER_TRADE] V5 daily status` — equity, cash, and every open position with
+     the close that would sell it;
 4. puts the same report on the run's summary page, and keeps `paper_state.json`
-   as a downloadable artifact for 90 days.
+   as a downloadable artifact for 90 days;
+5. if anything fails, sends Telegram a short `FAILED` notice with a link to the
+   log — so a silent day always means something is wrong with GitHub itself.
 
 ### Why there is no state to lose
 
@@ -55,6 +58,15 @@ The account starts flat on `PAPER_START`: a trend already under way is joined
 only on its next breakout. Changing `PAPER_START`, the symbols or the rules
 restarts the record.
 
+### Telegram setup
+
+Paper messages reach Telegram through two repository secrets. In the
+repository: **Settings → Secrets and variables → Actions → New repository
+secret**, then add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` with the values
+from your `.env`. Test with **Actions → V5 Paper Trading (daily) → Run
+workflow**. Locally, set `PAPER_TELEGRAM=true` in `.env` to get the same
+messages from `python main.py --paper`.
+
 ### Where to look
 
 * **Actions → "V5 Paper Trading (daily)" → a run.** The summary page has the
@@ -65,8 +77,14 @@ restarts the record.
 
 ### Good to know
 
-* **Dry-run is hard-coded** in the workflow, and no Telegram secret reaches the
-  job. `tests/test_workflow.py` fails if either ever changes.
+* **Real orders are impossible by construction.** The bot has no
+  order-routing code and its exchange client holds no keys;
+  `tests/test_safety.py` fails if either ever changes.
+* **Paper stays paper.** `DRY_RUN` is hard-coded in the workflow;
+  `PAPER_TELEGRAM` lets only `[PAPER_TRADE]` messages through to Telegram.
+  Only the two Telegram secrets are used, each only in the step that needs it,
+  and the workflow never runs on pull requests, so forks of this public
+  repository cannot read them. `tests/test_workflow.py` guards all of it.
 * **Same candles as the backtest.** The workflow reads Binance through
   `data-api.binance.vision`, Binance's public market-data host;
   `api.binance.com` refuses GitHub's US runners.
@@ -498,6 +516,7 @@ set the HTF depth; the LTF frame is paged automatically to cover the same span.
 | `PAPER_START` | — | First daily close the V5 paper account trades (`YYYY-MM-DD`, UTC). Required for `--paper`. |
 | `PAPER_EQUITY` | `ACCOUNT_EQUITY` | Starting paper equity. |
 | `PAPER_STATE_FILE` | `paper_state.json` | Where each paper run writes its record. |
+| `PAPER_TELEGRAM` | `false` | Send `[PAPER_TRADE]` messages to Telegram even under `DRY_RUN`. Needs the Telegram token and chat id. |
 | `MARKET_DATA_URL` | venue default | Public market-data host override, e.g. `https://data-api.binance.vision/api/v3`. |
 
 ---
@@ -525,7 +544,7 @@ Trading Bot/
 │   ├── paper.py             V5.0 paper trading: replay, alerts, status, record — no I/O
 │   ├── bot.py               MTF scan loop, scheduling, shutdown
 │   └── logging_setup.py     console + rotating file handlers
-└── tests/                   213 tests, no network required
+└── tests/                   222 tests, no network required
     ├── test_smc.py          displacement, premium/discount, CHoCH
     ├── test_watchlist.py    lifecycle + persistence
     ├── test_mtf.py          confirmation stages
@@ -534,7 +553,8 @@ Trading Bot/
     ├── test_trend.py        channels, regime, causality, live signal, sizing
     ├── test_trend_backtest.py  fills, costs, portfolio accounting, delistings
     ├── test_paper.py        paper account day by day, alerts, record, bot pass
-    ├── test_workflow.py     the daily workflow stays dry-run, secret-free
+    ├── test_workflow.py     the daily workflow stays paper; secrets scoped
+    ├── test_safety.py       no order-routing code, no exchange keys
     ├── test_risk.py  test_strategy.py  test_execution.py  test_notifier.py
 ```
 

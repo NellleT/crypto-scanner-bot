@@ -55,6 +55,7 @@ class ScannerBot:
         *,
         market_data: MarketDataClient | None = None,
         notifier: Notifier | None = None,
+        paper_notifier: Notifier | None = None,
         stop_event: threading.Event | None = None,
     ) -> None:
         self._settings = settings
@@ -70,6 +71,20 @@ class ScannerBot:
         )
 
         self._notifier: Notifier = notifier or self._build_notifier(settings)
+        # Paper messages may go to Telegram even under DRY_RUN (PAPER_TELEGRAM);
+        # every other alert still follows DRY_RUN.
+        self._paper_notifier: Notifier = paper_notifier or (
+            TelegramNotifier(
+                settings.telegram_bot_token,
+                settings.telegram_chat_id,
+                timeout_seconds=settings.http_timeout_seconds,
+                max_retries=settings.max_retries,
+                retry_backoff_seconds=settings.retry_backoff_seconds,
+                stop_event=self._stop_event,
+            )
+            if settings.paper_telegram
+            else self._notifier
+        )
 
         self._strategy = OrderBlockStrategy(
             min_body_ratio=settings.min_body_ratio,
@@ -473,6 +488,12 @@ class ScannerBot:
         settings = self._settings
         if settings.paper_start_ms is None:
             raise ValueError("PAPER_START is not set; the paper account needs a start date.")
+        if settings.paper_telegram:
+            verify = getattr(self._paper_notifier, "verify_credentials", None)
+            if callable(verify) and not verify():
+                raise paper.PaperDeliveryError(
+                    "Telegram rejected the bot token — check the TELEGRAM_BOT_TOKEN secret."
+                )
         params = params or TrendParams()
         now = now_ms if now_ms is not None else int(time.time() * 1000)
         elapsed_days = max(0, (now - settings.paper_start_ms) // 86_400_000)
@@ -491,9 +512,14 @@ class ScannerBot:
         if state.as_of_ms is not None and now - state.as_of_ms > 3 * 86_400_000:
             logger.warning("The newest daily close is %s — market data may be stale.",
                            paper._day(state.as_of_ms))
-        for text in paper.alerts(state):
-            self._notifier.send_text(text)
-        self._notifier.send_text(paper.status(state))
+        undelivered = 0
+        for text in [*paper.alerts(state), paper.status(state)]:
+            if settings.paper_telegram:
+                logger.info("Telegram <- %s", text.replace("\n", " | "))
+                if not self._paper_notifier.send_text(paper.telegram_html(text)):
+                    undelivered += 1
+            else:
+                self._paper_notifier.send_text(text)
         paper.save(state, settings.paper_state_file)
         logger.info("Paper state written to %s.", settings.paper_state_file)
 
@@ -501,6 +527,13 @@ class ScannerBot:
         if summary:
             with open(summary, "a", encoding="utf-8") as stream:
                 stream.write(paper.markdown(state))
+        if undelivered:
+            # After the record and summary are written: the run fails loudly,
+            # but nothing is lost, and tomorrow's run replays in full anyway.
+            raise paper.PaperDeliveryError(
+                f"{undelivered} paper message(s) could not be delivered to Telegram "
+                "— check the TELEGRAM_CHAT_ID secret and that the bot can post there."
+            )
         return state
 
     def simulate(self, *, candle_limit: int | None = None) -> SimulationReport:

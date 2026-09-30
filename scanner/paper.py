@@ -15,12 +15,18 @@ A run reports three things:
   paper account sells at the next open.
 * **Status** — equity, cash, and every open position with its trailing stop.
 
+Every message starts with ``[PAPER_TRADE]`` and a one-line headline, so on a
+phone it can never be mistaken for a real-money alert. With ``PAPER_TELEGRAM``
+on, the bot delivers them to Telegram (see :func:`telegram_html`) — still with
+no exchange credentials and no order-routing code anywhere in the bot.
+
 Orders queued at the newest close fill at the next day's open, which the next
 run sees as a closed candle and books at its real price.
 """
 
 from __future__ import annotations
 
+import html
 import json
 import math
 import os
@@ -36,7 +42,11 @@ from scanner.notifier import format_money, format_price, format_quantity
 from scanner.trend import TrendParams
 from scanner.trend_backtest import SPOT_COSTS, Costs, Order, TrendPortfolio
 
-TAG: Final[str] = "[PAPER]"
+TAG: Final[str] = "[PAPER_TRADE]"
+
+
+class PaperDeliveryError(RuntimeError):
+    """Telegram did not accept one or more paper messages."""
 
 
 def _day(ms: int) -> str:
@@ -148,34 +158,35 @@ def _buy_text(state: PaperState, order: Order) -> str:
                 if any(o.side == "SELL" and o.symbol == p.symbol for o in state.orders))
     if notional > state.cash + freed:
         note = f" (more than the {format_money(state.cash + freed)} cash available: it will be scaled down)"
-    return (
-        f"{TAG} BUY {order.symbol} — daily close {format_price(order.close)} broke the "
-        f"{state.params.entry_channel}-day high {format_price(order.level)}, above its "
-        f"{state.params.sma}-day average. Paper order at the next open: "
-        f"{format_quantity(quantity)} {_base(order.symbol)} ≈ ${format_money(notional)}{note}; "
-        f"trailing stop {format_price(order.stop)} "
-        f"({(order.stop / order.close - 1) * 100:+.1f}%), risking ${format_money(order.risk_amount)} "
-        f"({state.risk_pct:g}% of equity)."
-    )
+    return "\n".join([
+        f"{TAG} BUY {order.symbol}",
+        f"Daily close {format_price(order.close)} broke the {state.params.entry_channel}-day "
+        f"high {format_price(order.level)}, above its {state.params.sma}-day average.",
+        f"Paper order at the next open: {format_quantity(quantity)} {_base(order.symbol)} "
+        f"≈ ${format_money(notional)}{note}.",
+        f"Trailing stop {format_price(order.stop)} ({(order.stop / order.close - 1) * 100:+.1f}%)"
+        f" · risking ${format_money(order.risk_amount)} ({state.risk_pct:g}% of equity).",
+    ])
 
 
 def _sell_text(state: PaperState, order: Order) -> str:
+    lines = [
+        f"{TAG} SELL {order.symbol} (Trailing Stop Hit)",
+        f"Daily close {format_price(order.close)} fell below the "
+        f"{state.params.exit_channel}-day low {format_price(order.level)}.",
+        "Paper order at the next open.",
+    ]
     held = state.position(order.symbol)
-    detail = ""
     if held is not None:
         proceeds = held.quantity * order.close * (1 - state.costs.slippage) * (1 - state.costs.fee)
         pnl = proceeds - held.cost
-        detail = (
-            f" Held {format_quantity(held.quantity)} {_base(order.symbol)} since "
+        lines.append(
+            f"Held {format_quantity(held.quantity)} {_base(order.symbol)} since "
             f"{_day(held.entry_ms)} at {format_price(held.entry_price)}: about "
             f"{pnl / held.cost * 100:+.1f}% ({'+' if pnl >= 0 else '-'}${format_money(abs(pnl))}) "
             "at this close, after costs."
         )
-    return (
-        f"{TAG} SELL {order.symbol} (Trailing Stop Hit) — daily close "
-        f"{format_price(order.close)} fell below the {state.params.exit_channel}-day low "
-        f"{format_price(order.level)}. Paper order at the next open.{detail}"
-    )
+    return "\n".join(lines)
 
 
 def alerts(state: PaperState) -> list[str]:
@@ -201,21 +212,28 @@ def status(state: PaperState) -> str:
     lines = [
         f"{TAG} V5 daily status — close of {_day(state.as_of_ms)} (UTC)",
         f"Equity ${format_money(state.equity)} ({state.return_pct:+.2f}% since "
-        f"{_day(state.start_ms)}) · cash ${format_money(state.cash)} · "
-        f"{len(state.positions)} open · {len(state.closed)} closed",
+        f"{_day(state.start_ms)})",
+        f"Cash ${format_money(state.cash)} · {len(state.positions)} open · "
+        f"{len(state.closed)} closed",
     ]
     if not state.positions:
         lines.append("No open positions — waiting for a breakout.")
     for p in state.positions:
-        lines.append(
-            f"  {p.symbol:<10} {format_quantity(p.quantity)} {_base(p.symbol)} since "
-            f"{_day(p.entry_ms)} @ "
-            f"{format_price(p.entry_price)} · close {format_price(p.close)} "
-            f"({p.unrealized_pct:+.1f}%) · sells on a close below {format_price(p.exit_below)} "
-            f"({p.stop_distance_pct:+.1f}%)"
-        )
+        lines += [
+            f"• {p.symbol} {p.unrealized_pct:+.1f}% — {format_quantity(p.quantity)} "
+            f"{_base(p.symbol)} @ {format_price(p.entry_price)} since {_day(p.entry_ms)}",
+            f"   close {format_price(p.close)} · sells on a close below "
+            f"{format_price(p.exit_below)} ({p.stop_distance_pct:+.1f}%)",
+        ]
     lines.append(f"Next open: {_order_summary(state)}")
     return "\n".join(lines)
+
+
+def telegram_html(text: str) -> str:
+    """A paper message in Telegram's HTML parse mode: escaped, headline bold."""
+    head, _, rest = text.partition("\n")
+    rendered = f"<b>{html.escape(head, quote=False)}</b>"
+    return rendered + (f"\n{html.escape(rest, quote=False)}" if rest else "")
 
 
 def markdown(state: PaperState) -> str:
@@ -243,7 +261,9 @@ def markdown(state: PaperState) -> str:
     else:
         out.append("No open positions — waiting for a breakout.")
     out += ["", f"**Orders for the next open:** {_order_summary(state)}"]
-    out += [f"- {text.removeprefix(TAG + ' ')}" for text in alerts(state)]
+    for text in alerts(state):
+        head, _, rest = text.removeprefix(TAG + " ").partition("\n")
+        out.append(f"- **{head}** — {rest.replace(chr(10), ' ')}")
     out += ["", "_Paper trading only — DRY_RUN=true, no order is ever sent._", ""]
     return "\n".join(out)
 
@@ -314,6 +334,8 @@ def save(state: PaperState, path: Path) -> None:
 
 
 __all__ = [
+    "TAG",
+    "PaperDeliveryError",
     "PaperPosition",
     "PaperState",
     "alerts",
@@ -321,5 +343,6 @@ __all__ = [
     "replay",
     "save",
     "status",
+    "telegram_html",
     "to_dict",
 ]

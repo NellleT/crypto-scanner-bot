@@ -1,15 +1,21 @@
 name: V5 Paper Trading (daily)
 
-# V5.0 daily trend-following — PAPER TRADING ONLY. Nothing is ever sent to an
-# exchange, and alerts are logged rather than delivered.
+# V5.0 daily trend-following — PAPER TRADING ONLY. The bot has no exchange
+# credentials and no order-routing code: nothing it does can reach a real order.
 #
 # Runs once a day, five minutes after Binance's daily candle closes at 00:00
 # UTC. Each run rebuilds the paper account from PAPER_START by replaying the
 # rules over Binance's closed daily candles (scanner/paper.py), so nothing has
 # to survive between runs on these throwaway machines. Every run:
-#   - logs BUY / SELL (Trailing Stop Hit) alerts and a status report,
+#   - sends [PAPER_TRADE] BUY / SELL (Trailing Stop Hit) alerts and a daily
+#     status to Telegram (repository secrets TELEGRAM_BOT_TOKEN and
+#     TELEGRAM_CHAT_ID), and logs them,
 #   - writes the same report to the run's summary page,
-#   - keeps paper_state.json as a downloadable artifact for 90 days.
+#   - keeps paper_state.json as a downloadable artifact for 90 days,
+#   - tells Telegram if it failed, so a broken day never goes unnoticed.
+#
+# The secrets reach only the two steps that need them, and this workflow never
+# runs on pull requests, so forks of this public repository cannot read them.
 #
 # GitHub may start scheduled runs late under load, which is harmless for a
 # daily strategy. In a public repository GitHub also disables a schedule after
@@ -32,8 +38,8 @@ jobs:
     timeout-minutes: 15
     env:
       # Strictly paper. Hard-coded rather than a workflow input, so it cannot be
-      # switched off from the Actions UI — and no Telegram secret is exposed to
-      # this job, so nothing could be delivered even if it were.
+      # switched off from the Actions UI. Paper messages still reach Telegram
+      # through PAPER_TELEGRAM below; everything else stays dry.
       DRY_RUN: 'true'
 
     steps:
@@ -62,6 +68,10 @@ jobs:
           PAPER_START: '2026-09-30'
           PAPER_EQUITY: '10000'
           PAPER_STATE_FILE: paper_state.json
+          # [PAPER_TRADE] alerts and the daily status go to Telegram.
+          PAPER_TELEGRAM: 'true'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py --paper --dry-run
 
       - name: Keep the paper record
@@ -72,3 +82,19 @@ jobs:
           path: paper_state.json
           if-no-files-found: ignore
           retention-days: 90
+
+      - name: Tell Telegram the run failed
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets are not set; skipping the failure notice."
+            exit 0
+          fi
+          curl -sS --max-time 20 -o /dev/null \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=[PAPER_TRADE] Today's V5 paper run FAILED, so there are no alerts today. Log: ${RUN_URL}"

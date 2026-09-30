@@ -29,6 +29,7 @@ from typing import Final, Sequence
 from scanner.bot import ScannerBot
 from scanner.config import ConfigError, Settings, parse_symbols, validate_timeframe_token
 from scanner.exchange import MarketDataError
+from scanner.paper import PaperDeliveryError
 from scanner.logging_setup import configure_logging
 
 logger: Final[logging.Logger] = logging.getLogger("scanner.main")
@@ -225,6 +226,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             bot.run_forever()
     except MarketDataError as exc:
         logger.error("Market data unavailable: %s", exc)
+        return EXIT_RUNTIME_ERROR
+    except PaperDeliveryError as exc:
+        logger.error("Paper alert delivery failed: %s", exc)
         return EXIT_RUNTIME_ERROR
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")

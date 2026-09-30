@@ -1,8 +1,10 @@
 """Guards on the scheduled GitHub workflow.
 
 Paper trading must stay paper: these fail if DRY_RUN stops being hard-coded,
-if the run could be switched live from the Actions UI, or if a delivery secret
-is ever exposed to the job.
+if the run could be switched from the Actions UI, if any secret beyond the two
+Telegram ones appears, if a secret leaks into job-wide scope, or if the
+workflow could run on a pull request — where a fork of this public repository
+could reach the secrets.
 """
 
 from __future__ import annotations
@@ -41,8 +43,21 @@ def test_dry_run_is_hard_coded_and_cannot_be_switched_off() -> None:
     assert "--paper" in run and "--dry-run" in run
 
 
-def test_no_delivery_secret_reaches_the_job() -> None:
-    assert "secrets." not in WORKFLOW.read_text(encoding="utf-8")
+def test_only_the_two_telegram_secrets_are_used_and_only_per_step() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    used = set(re.findall(r"secrets\.([A-Z_]+)", text))
+    assert used == {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
+    job = load()["jobs"]["paper"]
+    assert not any("secrets." in str(v) for v in job["env"].values())
+
+
+def test_never_runs_on_pull_requests() -> None:
+    assert set(triggers(load())) <= {"schedule", "workflow_dispatch"}
+
+
+def test_paper_messages_are_routed_to_telegram() -> None:
+    (step,) = [s for s in load()["jobs"]["paper"]["steps"] if "main.py" in str(s.get("run", ""))]
+    assert step["env"]["PAPER_TELEGRAM"] == "true"
 
 
 def test_uses_binance_data_and_a_fixed_start() -> None:

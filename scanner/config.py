@@ -291,6 +291,10 @@ class Settings:
     paper_start_ms: int | None = None
     paper_equity: float = 10_000.0
     paper_state_file: Path = PROJECT_ROOT / DEFAULT_PAPER_STATE_FILE
+    # Deliver [PAPER_TRADE] messages to Telegram even under DRY_RUN. Paper
+    # messages only: DRY_RUN still governs everything else, and the bot has no
+    # order-routing code or exchange credentials at all.
+    paper_telegram: bool = False
 
     @classmethod
     def from_env(
@@ -393,6 +397,15 @@ class Settings:
                     f"PAPER_START={paper_start_raw!r} is not a YYYY-MM-DD date."
                 ) from exc
             paper_start_ms = int(start.timestamp() * 1000)
+        paper_telegram = _get_bool("PAPER_TELEGRAM", False)
+        if paper_telegram and not (
+            _get_str("TELEGRAM_BOT_TOKEN") and _get_str("TELEGRAM_CHAT_ID")
+        ):
+            raise ConfigError(
+                "PAPER_TELEGRAM=true needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID. "
+                "Locally, set them in .env; on GitHub, add them as repository "
+                "secrets (Settings > Secrets and variables > Actions)."
+            )
         paper_state_raw = _get_str("PAPER_STATE_FILE", DEFAULT_PAPER_STATE_FILE)
         paper_state_file = Path(paper_state_raw).expanduser()
         if not paper_state_file.is_absolute():
@@ -480,6 +493,7 @@ class Settings:
             paper_start_ms=paper_start_ms,
             paper_equity=_get_float("PAPER_EQUITY", account_equity, minimum=0.01),
             paper_state_file=paper_state_file,
+            paper_telegram=paper_telegram,
         )
 
     def describe(self) -> str:
