@@ -9,8 +9,12 @@ name: Crypto Trading Bot 24/7
 # GitHub's scheduler is best-effort and can lag several minutes under load; a
 # missed run just means that candle is skipped, never a duplicate alert.
 on:
-  schedule:
-    - cron: '5 * * * *'
+  # Scheduled runs are PAUSED (2026-09-30): there is no active strategy — v3.1
+  # is deprecated and V4 found no edge — so hourly runs only burned runner
+  # minutes. Manual runs still work. To resume, restore a schedule that matches
+  # TIMEFRAME (see the table above), e.g.:
+  #   schedule:
+  #     - cron: '5 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
