@@ -5,8 +5,10 @@
 > every variant tested. At 1:3 it won **20.1%** of 239 filled trades against the
 > 25% it needs to break even: **−52R after futures fees, −43% of the account at
 > 1% risk**. Keep `DRY_RUN=true`. The numbers are under
-> [Three-year backtest](#three-year-backtest). Its successor, V4.0, is in
-> research.
+> [Three-year backtest](#three-year-backtest). V4.0 (liquidity-sweep fades,
+> branch `v4-deviation-research`) found no edge. **V5.0 — daily trend-following
+> — passed its pre-registered backtest** and is the candidate for paper trading:
+> see [V5.0 research](#v50-research--daily-trend-following).
 
 Finds higher-timeframe **Order Blocks** with genuine displacement at the
 **extremes** of the dealing range, watches them, and only builds an order once
@@ -219,6 +221,95 @@ are superseded: they came from the replay and outcome model fixed in v3.1.1.
 
 ---
 
+## V5.0 research — daily trend-following
+
+**Research only; not wired into the live scanner yet.** The next step is paper
+trading, not money.
+
+### The rules (`scanner/trend.py`)
+
+On closed **daily** candles, evaluated once a day at the close:
+
+* **Regime** — the close is above its 200-day simple moving average (entries
+  only; an open trade is managed by its exit alone).
+* **Entry** — the close breaks above the highest high of the previous 20 days.
+  Market order at the next day's open.
+* **Exit** — the close breaks below the lowest low of the previous 10 days
+  (primary) or 20 days. Market order at the next day's open. No profit target.
+* **Risk** — 1% of equity per trade, sized on the distance from entry to the
+  initial trailing stop. Spot only: no leverage, so an entry needing more cash
+  than the account holds is shrunk to fit.
+
+Both channels exclude the current candle, so every level is known at the close
+it is judged at, and a test pins that indicators computed on a partial history
+equal the same rows computed on the full one.
+
+### The test, fixed before running it
+
+Binance daily candles from each pair's listing (BTC and ETH from 2017-08) to
+2026-09-29; trading starts 2018-03-04, once the 200-day average exists. Costs:
+0.1% spot fee plus 0.1% slippage **per side**. Two universes: the 7 configured
+pairs, and — because those 7 were picked in 2026, knowing which coins survived —
+**every non-stable USDT pair Binance listed by the end of 2018** (21 pairs,
+including ones since delisted). All five checks had to pass:
+
+| Check | Result | |
+| --- | --- | --- |
+| Net R per trade above zero with 95% confidence | +1.36R (CI +0.49 to +2.52) | ✅ |
+| Profitable in both halves (before / after 2022-03) | +161R / +72R | ✅ |
+| Profitable on the 2018 cohort (survivorship check) | +316R over 399 trades | ✅ |
+| Profitable with slippage raised to 0.25% per side | +229R | ✅ |
+| Max drawdown at most half of BTC buy-and-hold's | −21.1% vs −76.6% | ✅ |
+
+### Results — 7 pairs, 10-day exit
+
+| | V5.0 | BTC buy-and-hold |
+| --- | --- | --- |
+| Trades (win rate) | 171 (45.6%) — avg win +3.75R, avg loss −0.63R | — |
+| Net R after costs | +233R (+238R before costs) | — |
+| $10,000 became | $63,346 | $72,831 |
+| CAGR | 24.0% | 26.0% |
+| Max drawdown | **−21.1%** | −76.6% |
+| Sharpe | **1.24** | 0.69 |
+| Average capital in the market | 14% | 100% |
+
+| Market phase | V5.0 | BTC |
+| --- | --- | --- |
+| 2018 bear | −2.1% | −72.0% |
+| 2019 recovery | +7.4% | +49.5% |
+| 2020–21 bull | +244.4% | +1,100.1% |
+| 2022 bear | −5.6% | −74.9% |
+| 2023 → 2026-09 | +87.6% | +430.1% |
+
+A 20-day exit is similar (134 trades, +273R, CAGR 24.0%, drawdown −25.3%). All 20
+neighbouring classic settings — SMA 100/150/200/250, entry 10/20/55, exit 10/20 —
+were profitable after costs (CAGR 17–29%, drawdown −17% to −27%), so the result
+does not hinge on the exact numbers. `python main.py --backtest-v5` reruns it on
+fresh data and reproduces the figures above.
+
+### Read this before the headline
+
+* **It is a drawdown strategy, not a return strategy.** It roughly matched BTC's
+  return with a quarter of the drawdown, by being out of the market in bears.
+  In bull markets it lags badly (+88% vs +430% since late 2022), because 1%
+  risk on wide stops keeps only ~14% of capital invested on average.
+* **Profits come from a few big trends.** The 5 best trades made 57% of net R,
+  and the 2020–21 bull two-thirds of it. Most trades are small losses; the
+  median trade is about −0.05R.
+* **Long dry spells are normal.** The account went 822 days without a new
+  equity high.
+* **More coins, more correlated risk.** On the 21-pair 2018 cohort it stayed
+  profitable, but the drawdown reached −50.7%: in a crash, many longs stop out
+  together.
+* **The breakout itself is not proven to matter.** Entering on random days above
+  the 200-day average, with the same exit, did slightly worse (+14.1% per trade
+  against +22.8%) but the difference is not statistically significant. The edge
+  appears to come from being long only in uptrends and from the trailing exit.
+* **A backtest is not a forward test.** No slippage beyond the modelled 0.1–0.25%,
+  no exchange outages, no taxes.
+
+---
+
 ## Measured behaviour
 
 The replay behind the backtest above — the same report `--simulate` prints
@@ -299,6 +390,7 @@ pip install -r requirements.txt
 cp .env.example .env            # add Telegram credentials + ACCOUNT_EQUITY
 
 python main.py --simulate                    # replay history, print the funnel
+python main.py --backtest-v5                 # V5.0 research backtest, daily, all history
 python main.py --once --dry-run              # one live pass, sends nothing
 python main.py --once --dry-run --log-level DEBUG   # per-symbol rejections
 python main.py                               # run continuously
@@ -361,15 +453,19 @@ Trading Bot/
 │   ├── analytics.py         historical replay + funnel report
 │   ├── regime.py            ADX + structural regime, kill switch — no I/O
 │   ├── strategy.py          HTF filter chain, typed rejection stages
+│   ├── trend.py             V5.0 daily trend rules: SMA, Donchian, sizing — no I/O
+│   ├── trend_backtest.py    V5.0 trades, spot portfolio, costs, benchmark — no I/O
 │   ├── notifier.py          Telegram delivery + dry-run console notifier
 │   ├── bot.py               MTF scan loop, scheduling, shutdown
 │   └── logging_setup.py     console + rotating file handlers
-└── tests/                   182 tests, no network required
+└── tests/                   198 tests, no network required
     ├── test_smc.py          displacement, premium/discount, CHoCH
     ├── test_watchlist.py    lifecycle + persistence
     ├── test_mtf.py          confirmation stages
     ├── test_regime.py       ADX correctness, causality, both gates
     ├── test_replay.py       replay fidelity to the live scanner's passes
+    ├── test_trend.py        channels, regime, causality, live signal, sizing
+    ├── test_trend_backtest.py  fills, costs, portfolio accounting, delistings
     ├── test_risk.py  test_strategy.py  test_execution.py  test_notifier.py
 ```
 

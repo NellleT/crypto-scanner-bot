@@ -6,6 +6,10 @@ extreme of the dealing range (discount for longs, premium for shorts). Even
 then it is only *watched*: an order is built when price returns to the zone and
 the lower timeframe prints a change of character with its own gap. Zones expire
 if the target is reached first, if structure breaks, or with age.
+
+v3.1 is deprecated: a live-faithful three-year backtest found negative
+expectancy in every variant. :mod:`scanner.trend` holds the V5.0 research model
+(daily Donchian trend-following), backtested but not yet wired live.
 """
 
 from __future__ import annotations
@@ -70,6 +74,15 @@ from scanner.strategy import (
     StrategyResult,
     TradeSignal,
 )
+from scanner.trend import (
+    SignalKind,
+    TrendParams,
+    TrendPlan,
+    TrendSignal,
+    latest_signal,
+    plan_trend_entry,
+    trend_frame,
+)
 from scanner.watchlist import (
     InvalidationReason,
     WatchedZone,
@@ -106,11 +119,15 @@ __all__ = [
     "RegimeMethod",
     "RegimeReading",
     "Settings",
+    "SignalKind",
     "SimulationReport",
     "StrategyResult",
     "SwingRange",
     "TradePlan",
     "TradeSignal",
+    "TrendParams",
+    "TrendPlan",
+    "TrendSignal",
     "WatchState",
     "WatchedZone",
     "Watchlist",
@@ -122,8 +139,10 @@ __all__ = [
     "detect_order_block",
     "find_choch",
     "find_fvg_after",
+    "latest_signal",
     "fvg_frame",
     "order_block_mask",
+    "plan_trend_entry",
     "position_size",
     "premium_discount_frame",
     "simulate",
@@ -132,6 +151,7 @@ __all__ = [
     "swing_range",
     "to_binance_symbol",
     "to_unified_symbol",
+    "trend_frame",
     "validate_ohlcv",
 ]
 
