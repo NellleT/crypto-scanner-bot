@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
 
@@ -92,6 +93,9 @@ DEFAULT_MAX_WORKERS: Final[int] = 4
 
 #: Where the watched-zone state machine is persisted between runs.
 DEFAULT_WATCHLIST_FILE: Final[str] = "watchlist.json"
+
+#: Where each V5 paper-trading run writes its state, for reading and auditing.
+DEFAULT_PAPER_STATE_FILE: Final[str] = "paper_state.json"
 
 #: Upper bound accepted for CANDLE_LIMIT. Individual venues cap lower — Kraken
 #: returns at most ~720 candles — and :mod:`scanner.exchange` warns when a
@@ -280,6 +284,13 @@ class Settings:
     log_level: str
     log_file: Path | None
     dry_run: bool
+    # V5.0 paper trading. The paper account is replayed from paper_start_ms on
+    # every run, so changing the start date, the symbols or the rules restarts
+    # its history.
+    market_data_url: str | None = None
+    paper_start_ms: int | None = None
+    paper_equity: float = 10_000.0
+    paper_state_file: Path = PROJECT_ROOT / DEFAULT_PAPER_STATE_FILE
 
     @classmethod
     def from_env(
@@ -372,6 +383,22 @@ class Settings:
         if log_file is not None and not log_file.is_absolute():
             log_file = PROJECT_ROOT / log_file
 
+        paper_start_raw = _get_str("PAPER_START")
+        paper_start_ms: int | None = None
+        if paper_start_raw:
+            try:
+                start = datetime.strptime(paper_start_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"PAPER_START={paper_start_raw!r} is not a YYYY-MM-DD date."
+                ) from exc
+            paper_start_ms = int(start.timestamp() * 1000)
+        paper_state_raw = _get_str("PAPER_STATE_FILE", DEFAULT_PAPER_STATE_FILE)
+        paper_state_file = Path(paper_state_raw).expanduser()
+        if not paper_state_file.is_absolute():
+            paper_state_file = PROJECT_ROOT / paper_state_file
+        account_equity = _get_float("ACCOUNT_EQUITY", DEFAULT_ACCOUNT_EQUITY, minimum=0.01)
+
         return cls(
             # Credentials are only mandatory when we actually intend to send.
             telegram_bot_token=_get_str("TELEGRAM_BOT_TOKEN", required=not dry_run),
@@ -434,9 +461,7 @@ class Settings:
             reward_ratio=_get_float(
                 "REWARD_RATIO", DEFAULT_REWARD_RATIO, minimum=0.1, maximum=100.0
             ),
-            account_equity=_get_float(
-                "ACCOUNT_EQUITY", DEFAULT_ACCOUNT_EQUITY, minimum=0.01
-            ),
+            account_equity=account_equity,
             risk_per_trade_pct=_get_float(
                 "RISK_PER_TRADE_PCT",
                 DEFAULT_RISK_PER_TRADE_PCT,
@@ -451,6 +476,10 @@ class Settings:
             log_level=_get_str("LOG_LEVEL", "INFO").upper(),
             log_file=log_file,
             dry_run=dry_run,
+            market_data_url=_get_str("MARKET_DATA_URL") or None,
+            paper_start_ms=paper_start_ms,
+            paper_equity=_get_float("PAPER_EQUITY", account_equity, minimum=0.01),
+            paper_state_file=paper_state_file,
         )
 
     def describe(self) -> str:

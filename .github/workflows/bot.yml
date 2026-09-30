@@ -1,36 +1,40 @@
-name: Crypto Trading Bot 24/7
+name: V5 Paper Trading (daily)
 
-# The cron interval MUST match TIMEFRAME. Each run is a fresh process, and the
-# "already alerted" state is in memory only, so a candle scanned by two runs is
-# alerted twice. Hourly cron therefore pairs with TIMEFRAME=1h.
-#   1h  -> '5 * * * *'
-#   4h  -> '5 0,4,8,12,16,20 * * *'
-#   15m -> '5,20,35,50 * * * *'
-# GitHub's scheduler is best-effort and can lag several minutes under load; a
-# missed run just means that candle is skipped, never a duplicate alert.
+# V5.0 daily trend-following — PAPER TRADING ONLY. Nothing is ever sent to an
+# exchange, and alerts are logged rather than delivered.
+#
+# Runs once a day, five minutes after Binance's daily candle closes at 00:00
+# UTC. Each run rebuilds the paper account from PAPER_START by replaying the
+# rules over Binance's closed daily candles (scanner/paper.py), so nothing has
+# to survive between runs on these throwaway machines. Every run:
+#   - logs BUY / SELL (Trailing Stop Hit) alerts and a status report,
+#   - writes the same report to the run's summary page,
+#   - keeps paper_state.json as a downloadable artifact for 90 days.
+#
+# GitHub may start scheduled runs late under load, which is harmless for a
+# daily strategy. In a public repository GitHub also disables a schedule after
+# 60 days without a commit: if that happens, re-enable it from the Actions tab.
 on:
-  # Scheduled runs are PAUSED (2026-09-30): there is no active strategy — v3.1
-  # is deprecated and V4 found no edge — so hourly runs only burned runner
-  # minutes. Manual runs still work. To resume, restore a schedule that matches
-  # TIMEFRAME (see the table above), e.g.:
-  #   schedule:
-  #     - cron: '5 * * * *'
+  schedule:
+    - cron: '5 0 * * *'
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Log alerts instead of sending them'
-        type: boolean
-        default: true
+
+permissions:
+  contents: read
 
 concurrency:
-  # A late run must not overlap the next scheduled one.
-  group: crypto-scanner
+  group: v5-paper
   cancel-in-progress: false
 
 jobs:
-  run-bot:
+  paper:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    env:
+      # Strictly paper. Hard-coded rather than a workflow input, so it cannot be
+      # switched off from the Actions UI — and no Telegram secret is exposed to
+      # this job, so nothing could be delivered even if it were.
+      DRY_RUN: 'true'
 
     steps:
       - name: Checkout repository
@@ -47,30 +51,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Trading Bot
+      - name: Run V5 paper trading
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Binance and Bybit both restrict the IP ranges GitHub's runners use,
-          # so neither can serve market data here. Kraken is US-regulated and
-          # does not geo-block them.
-          # WARNING: Binance restricts GitHub's runner IP ranges, so this
-          # workflow CANNOT fetch Binance data. Kraken is used here so the
-          # schedule keeps running, but v3.0 emits limit orders at exact
-          # order-block edges and Kraken prices those levels up to 1.3% away
-          # from Binance. Treat CI output as indicative only — run on a host
-          # Binance serves before routing anything.
-          EXCHANGE_ID: kraken
-          # Optional overrides. Unset secrets arrive as empty strings, which the
-          # config layer treats as "not set" and falls back to its defaults.
-          SYMBOLS: ${{ secrets.SYMBOLS }}
-          ACCOUNT_EQUITY: ${{ secrets.ACCOUNT_EQUITY }}
-          TIMEFRAME: ${{ secrets.TIMEFRAME }}
-          # v3.1 is deprecated, so scheduled runs never send alerts. On a
-          # schedule `inputs` is empty, which used to fall through to the config
-          # default (false); only a manual run can now opt out of dry-run.
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry_run) || 'true' }}
-        run: |
-          # --once is required: the default mode runs forever, which on a cron
-          # schedule would pin a job until the timeout and overlap the next run.
-          python main.py --once
+          EXCHANGE_ID: binance
+          # Binance's public market-data host serves the same candles the
+          # backtest used; api.binance.com refuses GitHub's US-based runners.
+          MARKET_DATA_URL: https://data-api.binance.vision/api/v3
+          # The first daily close the paper account trades. Changing it — or the
+          # symbols, or the rules — restarts the paper record from scratch.
+          PAPER_START: '2026-09-30'
+          PAPER_EQUITY: '10000'
+          PAPER_STATE_FILE: paper_state.json
+        run: python main.py --paper --dry-run
+
+      - name: Keep the paper record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-state-${{ github.run_number }}
+          path: paper_state.json
+          if-no-files-found: ignore
+          retention-days: 90

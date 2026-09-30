@@ -55,8 +55,10 @@ class MarketDataClient:
         max_retries: int = 3,
         retry_backoff_seconds: float = 2.0,
         stop_event: threading.Event | None = None,
+        public_api_url: str | None = None,
     ) -> None:
         self._exchange_id = exchange_id
+        self._public_api_url = public_api_url
         self._max_retries = max_retries
         self._retry_backoff_seconds = retry_backoff_seconds
         self._stop_event = stop_event or threading.Event()
@@ -68,13 +70,24 @@ class MarketDataClient:
         except AttributeError as exc:
             raise MarketDataError(f"Unknown CCXT exchange id {exchange_id!r}.") from exc
 
+        options: dict[str, object] = {"defaultType": "spot"}
+        if exchange_id == "binance":
+            # Spot market data only. Loading derivatives markets as well would
+            # contact the futures hosts, which are refused in regions where
+            # spot data is not.
+            options["fetchMarkets"] = ["spot"]
         self._exchange: ccxt.Exchange = exchange_class(
             {
                 "enableRateLimit": True,  # let CCXT throttle to the venue's limits
                 "timeout": int(timeout_seconds * 1000),
-                "options": {"defaultType": "spot"},
+                "options": options,
             }
         )
+        if public_api_url:
+            # A market-data-only mirror of the venue's public API, e.g. Binance's
+            # data-api.binance.vision: the same candles, served to regions (like
+            # GitHub's US runners) that api.binance.com refuses.
+            self._exchange.urls["api"]["public"] = public_api_url.rstrip("/")
 
     @property
     def exchange_id(self) -> str:
@@ -359,6 +372,7 @@ class MarketDataClient:
                     max_retries=self._max_retries,
                     retry_backoff_seconds=self._retry_backoff_seconds,
                     stop_event=self._stop_event,
+                    public_api_url=self._public_api_url,
                 )
                 clone._exchange.markets = self._exchange.markets
                 clone._exchange.markets_by_id = self._exchange.markets_by_id

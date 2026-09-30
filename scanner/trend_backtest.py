@@ -237,6 +237,144 @@ def trade_stats(
 # Portfolio
 # ---------------------------------------------------------------------------
 @dataclass(slots=True)
+class Holding:
+    """An open spot position."""
+
+    symbol: str
+    quantity: float
+    signal_ms: int        # open of the day whose close signalled the entry
+    entry_ms: int         # open of the fill day
+    entry_price: float    # fill price, slippage included
+    cost: float           # cash spent, fee included
+    initial_stop: float
+
+
+@dataclass(frozen=True, slots=True)
+class Order:
+    """An order queued at a daily close, to fill at the next open."""
+
+    symbol: str
+    side: str             # BUY | SELL
+    signal_ms: int        # open of the day whose close decided it
+    close: float          # that close
+    level: float          # the channel it broke
+    stop: float           # BUY: initial trailing stop; SELL: NaN
+    risk_amount: float    # BUY: equity at the close x risk; SELL: 0
+
+
+class TrendPortfolio:
+    """One spot account run through the V5 rules, one daily candle at a time.
+
+    The backtest and the paper trader drive this same object, so a paper record
+    is the backtest continued forward rather than a re-implementation of it.
+
+    Each :meth:`step`: fill the queued orders at the open — exits first, freeing
+    cash, then entries in symbol order, each shrunk to the cash available (no
+    leverage) — sell any holding whose data has ended (delisted) at its last
+    close, mark to market at the close, then queue the close's signals.
+    """
+
+    def __init__(
+        self,
+        frames: Mapping[str, pd.DataFrame],
+        params: TrendParams | None = None,
+        costs: Costs = SPOT_COSTS,
+        *,
+        equity: float = 10_000.0,
+        risk_pct: float = 1.0,
+        min_notional: float = 10.0,
+    ) -> None:
+        self.params = params or TrendParams()
+        self.costs = costs
+        self.risk_pct = risk_pct
+        self.min_notional = min_notional
+        self.data = {
+            s: trend_frame(df, self.params).set_index("timestamp")
+            for s, df in frames.items() if len(df)
+        }
+        self.cash = equity
+        self.equity = equity
+        self.invested = 0.0
+        self.holdings: dict[str, Holding] = {}
+        self.orders: dict[str, Order] = {}     # queued at the last close
+        self.fills: list[dict] = []
+        self.capped = 0
+        self.skipped = 0
+        self.last_day: int | None = None
+
+    def days(self, start_ms: int | None = None) -> list[int]:
+        """Every daily candle open in the data, from ``start_ms`` on."""
+        days = sorted(set().union(*(d.index for d in self.data.values())))
+        return days if start_ms is None else [d for d in days if d >= start_ms]
+
+    def step(self, day: int) -> None:
+        self._fill(day)
+        self._sell_delisted(day)
+        self._mark(day)
+        self._queue(day)
+        self.last_day = day
+
+    def _sell(self, symbol: str, raw: float, day: int, kind: str) -> None:
+        pos = self.holdings.pop(symbol)
+        price = raw * (1 - self.costs.slippage)
+        proceeds = pos.quantity * price * (1 - self.costs.fee)
+        self.cash += proceeds
+        self.fills.append({
+            "symbol": symbol, "entry_ms": pos.entry_ms, "exit_ms": day,
+            "quantity": pos.quantity, "entry_price": pos.entry_price, "exit_price": price,
+            "cost": pos.cost, "proceeds": proceeds, "kind": kind,
+        })
+
+    def _fill(self, day: int) -> None:
+        queued, self.orders = self.orders, {}
+        for symbol in sorted(s for s, o in queued.items() if o.side == "SELL"):
+            if symbol in self.holdings and day in self.data[symbol].index:
+                self._sell(symbol, float(self.data[symbol].at[day, "open"]), day, "channel")
+        for symbol in sorted(s for s, o in queued.items() if o.side == "BUY"):
+            order = queued[symbol]
+            if day not in self.data[symbol].index or symbol in self.holdings:
+                continue
+            price = float(self.data[symbol].at[day, "open"]) * (1 + self.costs.slippage)
+            quantity = order.risk_amount / (order.close - order.stop)
+            if quantity * price * (1 + self.costs.fee) > self.cash:
+                quantity = self.cash / (price * (1 + self.costs.fee))
+                self.capped += 1
+            if quantity * price < self.min_notional:
+                self.skipped += 1
+                continue
+            cost = quantity * price * (1 + self.costs.fee)
+            self.cash -= cost
+            self.holdings[symbol] = Holding(symbol, quantity, order.signal_ms, day,
+                                            price, cost, order.stop)
+
+    def _sell_delisted(self, day: int) -> None:
+        for symbol in [s for s in self.holdings
+                       if day not in self.data[s].index and day > self.data[s].index[-1]]:
+            self._sell(symbol, float(self.data[symbol]["close"].iloc[-1]), day, "delisted")
+
+    def _mark(self, day: int) -> None:
+        value = sum(pos.quantity * float(self.data[s].at[day, "close"])
+                    for s, pos in self.holdings.items() if day in self.data[s].index)
+        self.equity = self.cash + value
+        self.invested = value / self.equity if self.equity > 0 else 0.0
+
+    def _queue(self, day: int) -> None:
+        for symbol, frame in self.data.items():
+            if day not in frame.index:
+                continue
+            row = frame.loc[day]
+            if symbol in self.holdings:
+                if bool(row["exit_signal"]):
+                    self.orders[symbol] = Order(symbol, "SELL", day, float(row["close"]),
+                                                float(row["exit_level"]), float("nan"), 0.0)
+            elif bool(row["entry_signal"]) and float(row["close"]) > float(row["next_stop"]):
+                self.orders[symbol] = Order(
+                    symbol, "BUY", day, float(row["close"]), float(row["entry_level"]),
+                    float(row["next_stop"]), self.equity * self.risk_pct / 100.0,
+                )
+
+
+@dataclass(slots=True)
 class PortfolioResult:
     equity: pd.Series                 # mark-to-market equity at each daily close
     exposure: pd.Series               # invested fraction of equity at each close
@@ -255,88 +393,18 @@ def simulate_portfolio(
     start_ms: int | None = None,
     min_notional: float = 10.0,
 ) -> PortfolioResult:
-    """Run the rules as one spot account, day by day.
-
-    Each day: fills at the open (exits first, freeing cash, then entries in
-    symbol order), delisted holdings sold at their last close, mark-to-market
-    at the close, then the close's signals queued for tomorrow's open. Entries
-    are sized on the equity at the signal close.
-    """
-    params = params or TrendParams()
-    data = {s: trend_frame(df, params).set_index("timestamp") for s, df in frames.items() if len(df)}
-    days = sorted(set().union(*(d.index for d in data.values())))
-    if start_ms is not None:
-        days = [d for d in days if d >= start_ms]
-
-    cash = equity
-    holdings: dict[str, dict] = {}            # symbol -> {qty, stop, entry_ms, cost}
-    pending_in: dict[str, dict] = {}          # symbol -> {risk_amount, reference, stop}
-    pending_out: set[str] = set()
+    """Run the rules as one spot account over history (see :class:`TrendPortfolio`)."""
+    book = TrendPortfolio(frames, params, costs, equity=equity, risk_pct=risk_pct,
+                          min_notional=min_notional)
+    days = book.days(start_ms)
     curve, invested = [], []
-    result = PortfolioResult(pd.Series(dtype=float), pd.Series(dtype=float))
-
-    def sell(symbol: str, raw: float, day: int, kind: str) -> None:
-        nonlocal cash
-        pos = holdings.pop(symbol)
-        price = raw * (1 - costs.slippage)
-        proceeds = pos["qty"] * price * (1 - costs.fee)
-        cash += proceeds
-        result.fills.append({"symbol": symbol, "entry_ms": pos["entry_ms"], "exit_ms": day,
-                             "cost": pos["cost"], "proceeds": proceeds, "kind": kind})
-
     for day in days:
-        # 1. Fills at the open.
-        for symbol in sorted(pending_out):
-            if symbol in holdings and day in data[symbol].index:
-                sell(symbol, float(data[symbol].at[day, "open"]), day, "channel")
-        pending_out.clear()
-        for symbol in sorted(pending_in):
-            order = pending_in[symbol]
-            if day not in data[symbol].index or symbol in holdings:
-                continue
-            price = float(data[symbol].at[day, "open"]) * (1 + costs.slippage)
-            qty = order["risk_amount"] / (order["reference"] - order["stop"])
-            if qty * price * (1 + costs.fee) > cash:
-                qty = cash / (price * (1 + costs.fee))
-                result.capped += 1
-            if qty * price < min_notional:
-                result.skipped += 1
-                continue
-            cost = qty * price * (1 + costs.fee)
-            cash -= cost
-            holdings[symbol] = {"qty": qty, "entry_ms": day, "cost": cost}
-        pending_in.clear()
-
-        # 2. Delisted: the symbol has no candle today but we still hold it.
-        for symbol in [s for s in holdings if day not in data[s].index and day > data[s].index[-1]]:
-            sell(symbol, float(data[symbol]["close"].iloc[-1]), day, "delisted")
-
-        # 3. Mark to market at the close.
-        value = sum(pos["qty"] * float(data[s].at[day, "close"])
-                    for s, pos in holdings.items() if day in data[s].index)
-        total = cash + value
-        curve.append(total)
-        invested.append(value / total if total > 0 else 0.0)
-
-        # 4. Tonight's signals, for tomorrow's open.
-        for symbol, frame in data.items():
-            if day not in frame.index:
-                continue
-            row = frame.loc[day]
-            if symbol in holdings:
-                if bool(row["exit_signal"]):
-                    pending_out.add(symbol)
-            elif bool(row["entry_signal"]) and float(row["close"]) > float(row["next_stop"]):
-                pending_in[symbol] = {
-                    "risk_amount": total * risk_pct / 100.0,
-                    "reference": float(row["close"]),
-                    "stop": float(row["next_stop"]),
-                }
-
+        book.step(day)
+        curve.append(book.equity)
+        invested.append(book.invested)
     index = pd.to_datetime(days, unit="ms", utc=True)
-    result.equity = pd.Series(curve, index=index)
-    result.exposure = pd.Series(invested, index=index)
-    return result
+    return PortfolioResult(pd.Series(curve, index=index), pd.Series(invested, index=index),
+                           book.fills, book.capped, book.skipped)
 
 
 def buy_and_hold(
@@ -432,6 +500,8 @@ __all__ = [
     "SPOT_COSTS",
     "Costs",
     "CurveStats",
+    "Holding",
+    "Order",
     "PortfolioResult",
     "TradeStats",
     "TrendTrade",
@@ -443,4 +513,5 @@ __all__ = [
     "simulate_portfolio",
     "symbol_trades",
     "trade_stats",
+    "TrendPortfolio",
 ]

@@ -8,8 +8,9 @@ the lower timeframe prints a change of character with its own gap. Zones expire
 if the target is reached first, if structure breaks, or with age.
 
 v3.1 is deprecated: a live-faithful three-year backtest found negative
-expectancy in every variant. :mod:`scanner.trend` holds the V5.0 research model
-(daily Donchian trend-following), backtested but not yet wired live.
+expectancy in every variant. V5.0 — daily Donchian trend-following
+(:mod:`scanner.trend`) — passed its backtest and paper-trades daily
+(:mod:`scanner.paper`); nothing is ever routed to an exchange.
 """
 
 from __future__ import annotations
@@ -155,4 +156,4 @@ __all__ = [
     "validate_ohlcv",
 ]
 
-__version__ = "3.1.1"
+__version__ = "5.0.0"

@@ -4,8 +4,9 @@ Watches a configurable set of pairs for extreme order blocks with real
 displacement, then confirms entries on a lower timeframe before building an
 order. Use --simulate to replay the pipeline over history and report the funnel.
 
-v3.1 is deprecated (see README). --backtest-v5 evaluates the V5.0 research
-model — daily Donchian trend-following — on fetched daily history; not live.
+v3.1 is deprecated (see README). --backtest-v5 evaluates the V5.0 model —
+daily Donchian trend-following — on fetched daily history, and --paper runs
+one daily V5.0 paper-trading pass (replayed from PAPER_START).
 
 Usage::
 
@@ -14,6 +15,7 @@ Usage::
     python main.py --dry-run             # log alerts instead of sending them
     python main.py --timeframe 1h --symbols BTC/USDT,ETH/USDT
     python main.py --backtest-v5                  # V5.0 research backtest, all history
+    python main.py --paper --dry-run              # one daily V5.0 paper-trading pass
 """
 
 from __future__ import annotations
@@ -50,6 +52,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "Replay the pipeline over historical candles, print the funnel and "
             "signal-frequency report, then exit. Implies --dry-run."
+        ),
+    )
+    parser.add_argument(
+        "--paper",
+        action="store_true",
+        help=(
+            "Run one V5.0 daily paper-trading pass: replay the paper account from "
+            "PAPER_START, alert BUY / SELL / status, write PAPER_STATE_FILE, exit."
         ),
     )
     parser.add_argument(
@@ -178,13 +188,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     configure_logging(settings.log_level, settings.log_file)
 
+    if args.paper and settings.paper_start_ms is None:
+        print(
+            "Configuration error: --paper needs PAPER_START (YYYY-MM-DD), the first "
+            "daily close the paper account trades.",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG_ERROR
+
     bot: ScannerBot | None = None
     try:
         bot = ScannerBot(settings)
         bot.install_signal_handlers()
         bot.startup_checks()
 
-        if args.backtest_v5:
+        if args.paper:
+            from scanner.paper import status
+
+            print(status(bot.run_paper()))
+        elif args.backtest_v5:
             run_trend_backtest(bot, bars=args.history or 3_600)
         elif args.simulate:
             report = bot.simulate(candle_limit=args.history)

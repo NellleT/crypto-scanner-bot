@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import signal
 import threading
 import time
@@ -32,9 +33,11 @@ from scanner.config import Settings
 from scanner.exchange import MarketDataClient, MarketDataError
 from scanner.execution import ExecutionOrder, build_execution_order
 from scanner.mtf import LtfTrigger, confirm_entry
+from scanner import paper
 from scanner.notifier import ConsoleNotifier, Notifier, TelegramNotifier
 from scanner.regime import RegimeFilter
 from scanner.strategy import FilterStage, OrderBlockStrategy, StrategyResult, TradeSignal
+from scanner.trend import TrendParams
 from scanner.watchlist import WatchedZone, Watchlist, WatchState
 
 logger: Final[logging.Logger] = logging.getLogger(__name__)
@@ -63,6 +66,7 @@ class ScannerBot:
             max_retries=settings.max_retries,
             retry_backoff_seconds=settings.retry_backoff_seconds,
             stop_event=self._stop_event,
+            public_api_url=settings.market_data_url,
         )
 
         self._notifier: Notifier = notifier or self._build_notifier(settings)
@@ -451,6 +455,53 @@ class ScannerBot:
             if not frame.empty:
                 frames[symbol] = frame
         return frames
+
+    # ------------------------------------------------------------------
+    # V5.0 paper trading
+    # ------------------------------------------------------------------
+    def run_paper(
+        self, *, params: TrendParams | None = None, now_ms: int | None = None
+    ) -> paper.PaperState:
+        """One daily paper-trading pass: rebuild the account, alert, record.
+
+        The account is replayed from ``PAPER_START`` on every run (see
+        :mod:`scanner.paper`), so nothing needs to survive between runs. Every
+        configured symbol must load: replaying without one would silently
+        rewrite the paper history as if that coin had never been traded, so a
+        missing symbol fails the run instead, and the next run replays in full.
+        """
+        settings = self._settings
+        if settings.paper_start_ms is None:
+            raise ValueError("PAPER_START is not set; the paper account needs a start date.")
+        params = params or TrendParams()
+        now = now_ms if now_ms is not None else int(time.time() * 1000)
+        elapsed_days = max(0, (now - settings.paper_start_ms) // 86_400_000)
+        frames = self.fetch_history(bars=int(elapsed_days) + params.warmup + 30, timeframe="1d")
+        missing = [s for s in settings.symbols if s not in frames]
+        if missing:
+            raise MarketDataError(
+                f"no daily data for {', '.join(missing)} — refusing to replay a partial "
+                "paper account"
+            )
+
+        state = paper.replay(
+            frames, start_ms=settings.paper_start_ms, equity=settings.paper_equity,
+            params=params, risk_pct=settings.risk_per_trade_pct,
+        )
+        if state.as_of_ms is not None and now - state.as_of_ms > 3 * 86_400_000:
+            logger.warning("The newest daily close is %s — market data may be stale.",
+                           paper._day(state.as_of_ms))
+        for text in paper.alerts(state):
+            self._notifier.send_text(text)
+        self._notifier.send_text(paper.status(state))
+        paper.save(state, settings.paper_state_file)
+        logger.info("Paper state written to %s.", settings.paper_state_file)
+
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as stream:
+                stream.write(paper.markdown(state))
+        return state
 
     def simulate(self, *, candle_limit: int | None = None) -> SimulationReport:
         """Replay the pipeline over stored candles and report the funnel."""

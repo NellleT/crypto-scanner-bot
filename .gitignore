@@ -30,3 +30,6 @@ env/
 .DS_Store
 Thumbs.db
 watchlist.json
+
+# V5 paper-trading record (rebuilt by replay on every run)
+paper_state.json

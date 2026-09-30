@@ -1,14 +1,16 @@
-# Crypto Scanner Bot v3.1.1 — Institutional MTF SMC Engine
+# Crypto Scanner Bot v5.0 — daily trend-following, paper trading
 
-> **Deprecated — do not trade this strategy.** A live-faithful three-year
-> backtest (2023-09 → 2026-09, 7 pairs, realistic orders and fees) lost money in
-> every variant tested. At 1:3 it won **20.1%** of 239 filled trades against the
-> 25% it needs to break even: **−52R after futures fees, −43% of the account at
-> 1% risk**. Keep `DRY_RUN=true`. The numbers are under
-> [Three-year backtest](#three-year-backtest). V4.0 (liquidity-sweep fades,
-> branch `v4-deviation-research`) found no edge. **V5.0 — daily trend-following
-> — passed its pre-registered backtest** and is the candidate for paper trading:
-> see [V5.0 research](#v50-research--daily-trend-following).
+> **Status: V5.0 paper-trades once a day on GitHub Actions. No real orders.**
+> It buys a coin whose daily close breaks its 20-day high while above its
+> 200-day average, and sells when a daily close breaks the 10-day low. It passed
+> a pre-registered 2018–2026 backtest
+> ([V5.0 research](#v50-research--daily-trend-following)); the paper run is the
+> forward test. See [Paper trading](#paper-trading-v50).
+>
+> The v3.1 order-block engine documented further down is **deprecated** — a
+> live-faithful three-year backtest lost money in every variant tested
+> ([Three-year backtest](#three-year-backtest)). V4.0 (liquidity-sweep fades,
+> branch `v4-deviation-research`) found no edge either.
 
 Finds higher-timeframe **Order Blocks** with genuine displacement at the
 **extremes** of the dealing range, watches them, and only builds an order once
@@ -16,6 +18,65 @@ the **lower timeframe confirms** with a change of character.
 
 Public market data only — **no exchange API keys are required or accepted.** The
 bot builds and displays orders; it never sends them.
+
+---
+
+## Paper trading (V5.0)
+
+### What happens every day
+
+At 00:05 UTC — five minutes after Binance's daily candle closes — GitHub Actions
+runs `python main.py --paper --dry-run`, which:
+
+1. fetches the seven pairs' closed daily candles from Binance;
+2. rebuilds the paper account from `PAPER_START` (2026-09-30, $10,000) by
+   replaying the V5 rules through the same engine the backtest uses;
+3. logs the day's alerts —
+   * `[PAPER] BUY SOL/USDT — daily close … broke the 20-day high …` (bought at
+     the next open),
+   * `[PAPER] SELL ETH/USDT (Trailing Stop Hit) — daily close … fell below the
+     10-day low …` (sold at the next open),
+   * `[PAPER] V5 daily status — …` (equity, cash, and every open position with
+     its trailing stop);
+4. puts the same report on the run's summary page, and keeps `paper_state.json`
+   as a downloadable artifact for 90 days.
+
+### Why there is no state to lose
+
+GitHub's runners are wiped after every run, so a file saved there is gone by
+the next day. Instead, the paper account is a pure function of the rules, the
+start date, the starting equity and the market's closed daily candles — so every
+run simply replays it from the start. Nothing can be lost or corrupted between
+runs, and the paper record is exactly the backtest continued forward.
+`paper_state.json` is still written on every run, for you to read; the bot never
+reads it back.
+
+The account starts flat on `PAPER_START`: a trend already under way is joined
+only on its next breakout. Changing `PAPER_START`, the symbols or the rules
+restarts the record.
+
+### Where to look
+
+* **Actions → "V5 Paper Trading (daily)" → a run.** The summary page has the
+  positions table and the day's orders; the log has every alert line.
+* **The run's artifacts** — `paper-state-<n>` holds `paper_state.json`: open
+  positions, orders for the next open, and every closed trade.
+* **Locally:** `python main.py --paper --dry-run`, with `PAPER_START` set.
+
+### Good to know
+
+* **Dry-run is hard-coded** in the workflow, and no Telegram secret reaches the
+  job. `tests/test_workflow.py` fails if either ever changes.
+* **Same candles as the backtest.** The workflow reads Binance through
+  `data-api.binance.vision`, Binance's public market-data host;
+  `api.binance.com` refuses GitHub's US runners.
+* **A coin that fails to load fails the run** rather than silently rewriting
+  the paper history; the next day's run replays in full.
+* **Late starts are harmless.** GitHub may start scheduled runs late under load;
+  any time that day gives the same answer.
+* **The 60-day rule.** In a public repository GitHub disables a schedule after
+  60 days without a commit, and emails a warning first. Re-enable it from the
+  Actions tab. The repository is public, so the paper logs are public too.
 
 ---
 
@@ -223,8 +284,8 @@ are superseded: they came from the replay and outcome model fixed in v3.1.1.
 
 ## V5.0 research — daily trend-following
 
-**Research only; not wired into the live scanner yet.** The next step is paper
-trading, not money.
+**Now paper trading daily** — see [Paper trading](#paper-trading-v50). No
+real money until the forward test has run long enough to judge.
 
 ### The rules (`scanner/trend.py`)
 
@@ -391,6 +452,7 @@ cp .env.example .env            # add Telegram credentials + ACCOUNT_EQUITY
 
 python main.py --simulate                    # replay history, print the funnel
 python main.py --backtest-v5                 # V5.0 research backtest, daily, all history
+python main.py --paper --dry-run             # one V5.0 paper-trading pass (needs PAPER_START)
 python main.py --once --dry-run              # one live pass, sends nothing
 python main.py --once --dry-run --log-level DEBUG   # per-symbol rejections
 python main.py                               # run continuously
@@ -432,7 +494,11 @@ set the HTF depth; the LTF frame is paged automatically to cover the same span.
 | `ADX_PERIOD` / `ADX_THRESHOLD` | `14` / `20` | ADX regime settings. |
 | `REGIME_SWING_STRENGTH` | `5` | Pivot strength for structural containment. |
 | `REGIME_LOOKBACK` | `200` | HTF candles the regime is read over (≤ `CANDLE_LIMIT`). |
-| `DRY_RUN` | `false` | Log alerts instead of sending them. **Keep `true`: v3.1 is deprecated.** |
+| `DRY_RUN` | `false` | Log alerts instead of sending them. **Keep `true`.** |
+| `PAPER_START` | — | First daily close the V5 paper account trades (`YYYY-MM-DD`, UTC). Required for `--paper`. |
+| `PAPER_EQUITY` | `ACCOUNT_EQUITY` | Starting paper equity. |
+| `PAPER_STATE_FILE` | `paper_state.json` | Where each paper run writes its record. |
+| `MARKET_DATA_URL` | venue default | Public market-data host override, e.g. `https://data-api.binance.vision/api/v3`. |
 
 ---
 
@@ -456,9 +522,10 @@ Trading Bot/
 │   ├── trend.py             V5.0 daily trend rules: SMA, Donchian, sizing — no I/O
 │   ├── trend_backtest.py    V5.0 trades, spot portfolio, costs, benchmark — no I/O
 │   ├── notifier.py          Telegram delivery + dry-run console notifier
+│   ├── paper.py             V5.0 paper trading: replay, alerts, status, record — no I/O
 │   ├── bot.py               MTF scan loop, scheduling, shutdown
 │   └── logging_setup.py     console + rotating file handlers
-└── tests/                   198 tests, no network required
+└── tests/                   213 tests, no network required
     ├── test_smc.py          displacement, premium/discount, CHoCH
     ├── test_watchlist.py    lifecycle + persistence
     ├── test_mtf.py          confirmation stages
@@ -466,6 +533,8 @@ Trading Bot/
     ├── test_replay.py       replay fidelity to the live scanner's passes
     ├── test_trend.py        channels, regime, causality, live signal, sizing
     ├── test_trend_backtest.py  fills, costs, portfolio accounting, delistings
+    ├── test_paper.py        paper account day by day, alerts, record, bot pass
+    ├── test_workflow.py     the daily workflow stays dry-run, secret-free
     ├── test_risk.py  test_strategy.py  test_execution.py  test_notifier.py
 ```
 
@@ -523,6 +592,5 @@ or future-schema file starts empty rather than crashing.
   candles are examined; older unmitigated blocks are not rediscovered.
 - **CHoCH is a simplification.** It uses a two-pivot lower-high / higher-low
   test, not a full market-structure model with BOS/liquidity labelling.
-- **GitHub Actions cannot run this properly** — Binance restricts its runner IP
-  ranges, and v3.1 needs both timeframes from the execution venue. Scheduled
-  runs are dry-run.
+- **GitHub Actions runs V5 paper trading only**, once a day, through Binance's
+  public market-data host. The v3.1 scanner is not scheduled.
